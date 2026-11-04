@@ -18,6 +18,9 @@ from src.data_loader import load_community, list_communities
 from src.model import FlexibleConsumerModel
 from src.community_model import CommunityModel
 
+import pandas as pd
+import numpy as np
+
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
 def run_reference(com, out_dir: Path) -> None:
