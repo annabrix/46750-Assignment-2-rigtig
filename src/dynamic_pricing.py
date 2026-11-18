@@ -18,6 +18,7 @@ from gurobipy import GRB
 from .community_model import add_member_block
 
 
+
 def best_response(d, x, end_soc: str = "initial") -> dict:
     """Lower level of DP: member d schedules its appliances against the internal prices x.
 
