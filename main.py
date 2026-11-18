@@ -18,6 +18,7 @@ from src.data_loader import load_community, list_communities
 from src.model import FlexibleConsumerModel
 from src.community_model import CommunityModel
 from src.dynamic_pricing import build_dp, solve_dp, solution_values
+from src.stochastic_pricing import draw_scenarios, evaluate_prices
 
 import numpy as np
 import pandas as pd
@@ -357,7 +358,39 @@ def run_q2(com, out_dir: Path, time_limit: float = 120) -> None:
         if row.get("blocking_members"):
             print(f"{row['variant']}: worse off than R -> {row['blocking_members']}")
 
+def run_q3_baseline(com, out_dir: Path, n: int = 100, seed: int = 100) -> None:
+    """Q3 step 1: the deterministic baseline DP (budget balance, theta = 1) on n out-of-sample scenarios.
 
+    Draws the scenarios (seed reported; the theta of every member and scenario is saved), posts the budget-balanced
+    DP prices, and evaluates them with optimistic tie-breaking. Prints the distribution over the scenarios of the
+    welfare cost, penalty, cap exceedance, manager's surplus and IR violation, and traces the worst scenarios back
+    to their theta. Writes q3_scenarios_seed<seed>_theta.csv and q3_baseline_<scenario|member>.csv.
+    """
+    R = {d.consumer_id: FlexibleConsumerModel(d).build().solve().objective for d in com.members}
+    x = solve_dp(build_dp(com, "bb", R), time_limit=120)["hourly"].x.to_numpy()
+    S = draw_scenarios(com, n=n, seed=seed)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"scenario": s["id"], **s["theta"]["profile"]} for s in S]).to_csv(
+        out_dir / f"q3_scenarios_seed{seed}_theta.csv", index=False)
+    per_s, per_m = evaluate_prices(com, x, S)
+    per_s.to_csv(out_dir / "q3_baseline_scenario.csv", index=False)
+    per_m.to_csv(out_dir / "q3_baseline_member.csv", index=False)
+
+    cols = ["welfare_cost_DKK", "penalty_DKK", "exceedance_kWh", "hours_above_cap", "surplus_DKK",
+            "n_worse_off_than_R", "total_IR_violation_DKK"]
+    summary = per_s[cols].describe(percentiles=[0.05, 0.5, 0.95]).T[["mean", "min", "5%", "50%", "95%", "max"]]
+    print(f"\nQ3 baseline: budget-balanced DP prices on {n} out-of-sample scenarios (seed {seed})")
+    print(summary.round(2).to_string())
+    print(f"\nscenarios with cap exceedance: {int((per_s.exceedance_kWh > 1e-6).sum())} of {n}"
+          f" | with a budget deficit (surplus < 0): {int((per_s.surplus_DKK < -1e-6).sum())} of {n}")
+
+    print("\nWorst scenarios (highest welfare cost) and the members with the lowest theta (wanting more energy):")
+    for _, w in per_s.nlargest(3, "welfare_cost_DKK").iterrows():
+        th = per_m[per_m.scenario == w.scenario].nsmallest(4, "theta")
+        print(f"  scenario {int(w.scenario)}: cost {w.welfare_cost_DKK:.2f}, exceedance {w.exceedance_kWh:.2f} kWh, "
+              f"surplus {w.surplus_DKK:.2f} | " + ", ".join(f"{r.consumer_id} {r.theta:.2f}" for r in th.itertuples()))
+        
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--community", default="base", help=f"base (shipped) or your own params_community_<name>.json; available: {list_communities()}")
@@ -371,6 +404,7 @@ def main() -> None:
     ap.add_argument("--settlement", action="store_true", help="Q1: settle C at the internal prices, test budget balance and IR")
     ap.add_argument("--q2-sensitivity", action="store_true", help="Q2: DP (cap, budget balance) over the discount; blocking members")
     ap.add_argument("--q2", action="store_true", help="Q2: DP on the base case, cap -> budget balance -> IR")
+    ap.add_argument("--q3-baseline", action="store_true", help="Q3: deterministic DP prices on 100 out-of-sample scenarios")
     
     
     args = ap.parse_args()
@@ -402,6 +436,8 @@ def main() -> None:
         run_q2_sensitivity(com, RESULTS_DIR / args.community / args.day / "Q2")
     if args.q2:
         run_q2(com, RESULTS_DIR / args.community / args.day / "Q2")
+    if args.q3_baseline:
+        run_q3_baseline(com, RESULTS_DIR / args.community / args.day / "Q3")
 
 
 
