@@ -157,8 +157,12 @@ class StochasticDP:
         res = sdp.solve(time_limit=300)
 
     Switches of build():
-        objective  "expected": expected community cost (the base model SDP^E)
+        objective  "expected": expected community cost (the base model SDP^b)
+                   "cvar": (1 - beta_r) * expected cost + beta_r * CVaR_alpha of the cost (SDP^CVaR);
+                           alpha = fraction of worst scenarios (a multiple of 1/N), beta_r = weight in [0, 1]
         budget     "none" | "expectation" | "scenario": payments = grid bill, in expectation or in every scenario
+                   "chance": budget balance in expectation, and no deficit with probability >= 1 - eps on the
+                             scenarios (SDP^CC; one binary per scenario, big-M = big_m DKK)
         ir         "none" | "expectation" | "scenario": member cost <= its cost in R on the same scenario data
         x_lb, x_ub price bounds (DKK/kWh), default x >= 0 without upper bound, as in DP
     """
@@ -178,23 +182,25 @@ class StochasticDP:
         return self.R
 
     def build(self, *, objective: str = "expected", budget: str = "expectation", ir: str = "none",
+              alpha: float = 0.2, beta_r: float = 0.5, eps: float = 0.2, big_m: float = 50.0,
               x_lb=0.0, x_ub=np.inf, discount: float | None = None, cap=None,
               verbose: bool = False) -> "StochasticDP":
-        if objective != "expected":
-            raise ValueError("objective must be 'expected' (other representations are added as variants)")
-        for name, val in (("budget", budget), ("ir", ir)):
-            if val not in ("none", "expectation", "scenario"):
-                raise ValueError(f"{name} must be 'none', 'expectation' or 'scenario'")
+        if objective not in ("expected", "cvar"):
+            raise ValueError("objective must be 'expected' or 'cvar'")
+        if budget not in ("none", "expectation", "scenario", "chance"):
+            raise ValueError("budget must be 'none', 'expectation', 'scenario' or 'chance'")
+        if ir not in ("none", "expectation", "scenario"):
+            raise ValueError("ir must be 'none', 'expectation' or 'scenario'")
         ct, d0 = self.com.contract, self.com.members[0]
         beta = ct.tariff_discount_ratio if discount is None else float(discount)
-        alpha = ct.penalty_DKK_per_kWh
+        pen = ct.penalty_DKK_per_kWh               # alpha^DSO (the name alpha is the CVaR tail fraction)
         p = np.asarray(d0.energy_price, dtype=float)
         T = range(len(p))
         cap = np.broadcast_to(np.asarray(ct.capacity_limit_kW if cap is None else cap, dtype=float), (len(T),))
         a = p + (1 - beta) * d0.import_tariff
         b = p - (1 - beta) * d0.export_tariff
         lo = np.broadcast_to(np.asarray(x_lb, dtype=float), (len(T),))
-        hi = a + alpha if x_ub is None else np.broadcast_to(np.asarray(x_ub, dtype=float), (len(T),))
+        hi = a + pen if x_ub is None else np.broadcast_to(np.asarray(x_ub, dtype=float), (len(T),))
 
         m = gp.Model(self.name)
         m.Params.OutputFlag = int(verbose)
@@ -211,7 +217,7 @@ class StochasticDP:
             m.addConstrs((imp[s][t] - exp[s][t] == gp.quicksum(blk["q"][t] for blk in blocks[s].values())
                           for t in T), name=f"community_balance[{s}]")
             m.addConstrs((imp[s][t] - exc[s][t] <= cap[t] for t in T), name=f"DSO_cap[{s}]")
-            grid[s] = gp.quicksum(a[t] * imp[s][t] - b[t] * exp[s][t] + alpha * exc[s][t] for t in T)
+            grid[s] = gp.quicksum(a[t] * imp[s][t] - b[t] * exp[s][t] + pen * exc[s][t] for t in T)
             cost[s] = grid[s] + gp.quicksum(D[s].values())
             kkt[s] = {i: add_kkt(m, blk, x, f"{i}|{s}") for i, blk in blocks[s].items()}
             phi[s] = {i: kkt[s][i]["phi"] for i in blocks[s]}          # member cost (strong duality)
@@ -223,6 +229,13 @@ class StochasticDP:
             m.addConstr(gp.quicksum(self.pi[s] * surplus[s] for s in S) == 0, name="budget_balance_expected")
         elif budget == "scenario":
             m.addConstrs((surplus[s] == 0 for s in S), name="budget_balance")
+        v_def = {}
+        if budget == "chance":
+            # expected balance, and a deficit allowed only in scenarios with v_s = 1, at most eps of them
+            m.addConstr(gp.quicksum(self.pi[s] * surplus[s] for s in S) == 0, name="budget_balance_expected")
+            v_def = {s: m.addVar(vtype=GRB.BINARY, name=f"deficit_allowed[{s}]") for s in S}
+            m.addConstrs((surplus[s] >= -big_m * v_def[s] for s in S), name="no_deficit")
+            m.addConstr(gp.quicksum(self.pi[s] * v_def[s] for s in S) <= eps + 1e-9, name="deficit_probability")
 
         # individual rationality against R on the same scenario data
         if ir != "none":
@@ -235,12 +248,26 @@ class StochasticDP:
                 m.addConstrs((phi[s][i] <= R[(s, i)] for s in S for i in ids), name="IR")
 
         expected_cost = gp.quicksum(self.pi[s] * cost[s] for s in S)
-        m.setObjective(expected_cost, GRB.MINIMIZE)
+        zeta, eta, cvar = None, {}, None
+        if objective == "cvar":
+            # linear CVaR (Rockafellar-Uryasev): zeta = VaR threshold, eta_s = cost of scenario s above it
+            zeta = m.addVar(lb=-GRB.INFINITY, name="zeta")
+            eta = {s: m.addVar(lb=0.0, name=f"eta[{s}]") for s in S}
+            m.addConstrs((eta[s] >= cost[s] - zeta for s in S), name="cvar")
+            cvar = zeta + (1.0 / alpha) * gp.quicksum(self.pi[s] * eta[s] for s in S)
+            m.setObjective((1 - beta_r) * expected_cost + beta_r * cvar, GRB.MINIMIZE)
+        else:
+            m.setObjective(expected_cost, GRB.MINIMIZE)
         m.update()
         self.m, self.x, self.T, self.cap = m, x, T, cap
         self.v = {"blocks": blocks, "kkt": kkt, "phi": phi, "D": D, "pay": pay, "grid": grid, "cost": cost,
-                  "imp": imp, "exp": exp, "exc": exc, "surplus": surplus, "expected_cost": expected_cost}
+                  "imp": imp, "exp": exp, "exc": exc, "surplus": surplus, "expected_cost": expected_cost,
+                  "cvar": cvar, "v_def": v_def}
         self.settings = {"objective": objective, "budget": budget, "ir": ir}
+        if objective == "cvar":
+            self.settings.update(alpha=alpha, beta_r=beta_r)
+        if budget == "chance":
+            self.settings.update(eps=eps, big_m=big_m)
         return self
 
     def solve(self, *, time_limit: float = 300, mip_gap: float = 1e-4, x_start=None,
@@ -280,8 +307,13 @@ class StochasticDP:
                          "grid_bill_DKK": v["grid"][s].getValue(), "exceedance_kWh": exc.sum(),
                          "penalty_DKK": self.com.contract.penalty_DKK_per_kWh * exc.sum(),
                          "surplus_DKK": v["surplus"][s].getValue(),
+                         "deficit_allowed": int(round(v["v_def"][s].X)) if v["v_def"] else np.nan,
                          "n_worse_off_than_R": int((gains < -1e-5).sum()),
                          "total_IR_violation_DKK": float(-gains[gains < -1e-5].sum())})
-        out.update({"x": x, "expected_cost_DKK": v["expected_cost"].getValue(), "max_KKT_residual": max_res,
-                    "scenarios": pd.DataFrame(rows)})
+        scen = pd.DataFrame(rows)
+        out.update({"x": x, "objective_DKK": m.ObjVal, "expected_cost_DKK": v["expected_cost"].getValue(),
+                    "cvar_DKK": v["cvar"].getValue() if v["cvar"] is not None else np.nan,
+                    "max_KKT_residual": max_res, "scenarios": scen})
+        if v["v_def"] and (-scen.surplus_DKK).max() > 0.9 * self.settings["big_m"]:
+            raise RuntimeError("A deficit is close to big_m: increase big_m")
         return out
