@@ -219,7 +219,7 @@ def merge_scenarios(app: dict, community: dict, scaling: dict, mode: str = "alig
         out.append({"id": s, "probability": 1.0 / len(index_sets), "index": idx, "theta": theta, "members": members})
     return out
 
-
+##
 def expected_preference_scenario(app: dict, community: dict) -> dict:
     """consumer_id -> {appliance_id -> appliance dict} with the catalogue parameters unchanged (theta = 1 everywhere)."""
     cat = _catalogue_by_id(app)
