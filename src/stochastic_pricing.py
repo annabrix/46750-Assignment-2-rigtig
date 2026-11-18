@@ -5,6 +5,9 @@ each member's reference profile is rho_t ** theta, and its daily minimum follows
 
     draw_scenarios      joint scenarios of the community (seeded, aligned merging)
     scenario_members    the members as one scenario sees them, ready for the models of Q1 and Q2
+    reference_costs     every member's cost in R, per scenario (the IR benchmark)
+    build_sdp           the stochastic model SDP^x: shared prices, one lower level per member and scenario
+    solve_sdp           solve it; per-scenario results and KKT residual checks
 """
 from __future__ import annotations
 
@@ -18,6 +21,7 @@ from gurobipy import GRB
 from . import scenario_generation as sg
 from .community_model import CommunityModel, add_member_block
 from .dynamic_pricing import best_response
+from .dynamic_pricing import add_kkt, best_response
 
 
 def draw_scenarios(com, n: int, seed: int, quantities=("profile",), spec: dict | None = None) -> list[dict]:
@@ -142,3 +146,153 @@ def evaluate_prices(com, x, scenarios: list[dict], *, tie_break: str = "optimist
                      "n_worse_off_than_R": int((gains < -1e-5).sum()),
                      "total_IR_violation_DKK": float(-gains[gains < -1e-5].sum())})
     return pd.DataFrame(rows), pd.DataFrame(member_rows)
+
+def reference_costs(com, scenarios: list[dict]) -> dict:
+    """Cost of every member alone without contract (model R) in every scenario: {(scenario id, consumer id): DKK}."""
+    return {(s["id"], m.consumer_id): CommunityModel([m]).build(pooled=False).solve().objective
+            for s in scenarios for m in scenario_members(com, s)}
+
+
+def build_sdp(com, scenarios: list[dict], R_s: dict | None = None, *, requirements: str = "bb",
+              how: str = "expectation", min_relax: bool = False, discount: float | None = None, cap=None,
+              x_lb=0.0, x_ub=np.inf, end_soc: str = "initial", verbose: bool = False) -> dict:
+    """Stochastic dynamic pricing SDP: one price vector x for all scenarios, one copy of every member's
+    lower level (its KKT conditions) and of the connection point per scenario.
+
+    Switches of the parametrized model:
+      scenarios     the scenario set (list of joint scenarios from draw_scenarios), with probabilities pi_s
+      requirements  "cap" (contract only), "bb" (+ budget balance), "bb_ir" (+ individual rationality against R
+                    in the same scenario, costs R_s from reference_costs), "bb_ir_relax" (IR with slacks >= 0)
+      how           "expectation": the requirements hold in expectation over the scenarios (base model SDP^E);
+                    "every": they hold in every scenario
+      min_relax     objective = total IR relaxation (only with bb_ir_relax); otherwise the expected welfare cost
+    The objective is the expected community cost sum_s pi_s F_s (risk-neutral).
+    Prices: x_lb <= x_t <= x_ub (as in build_dp).
+    """
+    if requirements not in ("cap", "bb", "bb_ir", "bb_ir_relax"):
+        raise ValueError(f"Unknown requirements {requirements!r}")
+    if how not in ("expectation", "every"):
+        raise ValueError("how must be 'expectation' or 'every'")
+    if requirements in ("bb_ir", "bb_ir_relax") and R_s is None:
+        raise ValueError("Individual rationality needs the R costs per scenario (reference_costs)")
+
+    ct, d0 = com.contract, com.members[0]
+    beta = ct.tariff_discount_ratio if discount is None else float(discount)
+    alpha = ct.penalty_DKK_per_kWh
+    p = np.asarray(d0.energy_price, dtype=float)
+    T = range(len(p))
+    cap = np.broadcast_to(np.asarray(ct.capacity_limit_kW if cap is None else cap, dtype=float), (len(T),))
+    a = p + (1 - beta) * d0.import_tariff
+    b = p - (1 - beta) * d0.export_tariff
+    lo = np.broadcast_to(np.asarray(x_lb, dtype=float), (len(T),))
+    hi = a + alpha if x_ub is None else np.broadcast_to(np.asarray(x_ub, dtype=float), (len(T),))
+
+    m = gp.Model("SDP")
+    m.Params.OutputFlag = int(verbose)
+    x = m.addVars(T, lb=[float(v) for v in lo], ub=[float(v) for v in hi], name="x")   # first stage
+
+    S = [s["id"] for s in scenarios]
+    pi = {s["id"]: s["probability"] for s in scenarios}
+    blocks, kkt, D, phi, pay, imp, exp, exceed, grid, F = {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+    for sc in scenarios:                                                                 # second stage
+        s = sc["id"]
+        for d in scenario_members(com, sc):
+            k = (s, d.consumer_id)
+            blocks[k] = add_member_block(m, d, f"{d.consumer_id},s{s}", end_soc)
+            D[k] = blocks[k]["disutility"] + blocks[k]["pv_cost"]
+        imp[s] = m.addVars(T, name=f"P_imp[s{s}]")
+        exp[s] = m.addVars(T, name=f"P_exp[s{s}]")
+        exceed[s] = m.addVars(T, name=f"E[s{s}]")
+        m.addConstrs((imp[s][t] - exp[s][t] == gp.quicksum(blocks[k]["q"][t] for k in blocks if k[0] == s)
+                      for t in T), name=f"community_balance[s{s}]")
+        m.addConstrs((imp[s][t] - exceed[s][t] <= cap[t] for t in T), name=f"DSO_cap[s{s}]")
+        grid[s] = gp.quicksum(a[t] * imp[s][t] - b[t] * exp[s][t] + alpha * exceed[s][t] for t in T)
+        F[s] = grid[s] + gp.quicksum(D[k] for k in blocks if k[0] == s)
+
+    for k, blk in blocks.items():
+        kkt[k] = add_kkt(m, blk, x, f"{k[1]},s{k[0]}")
+        phi[k] = kkt[k]["phi"]                      # member cost (strong duality)
+        pay[k] = phi[k] - D[k]                      # member payment x.q
+    ids = sorted({k[1] for k in blocks})
+    expected_cost = gp.quicksum(pi[s] * F[s] for s in S)
+
+    if requirements != "cap":
+        surplus = {s: gp.quicksum(pay[k] for k in blocks if k[0] == s) - grid[s] for s in S}
+        if how == "expectation":
+            m.addConstr(gp.quicksum(pi[s] * surplus[s] for s in S) == 0, name="budget_balance")
+        else:
+            m.addConstrs((surplus[s] == 0 for s in S), name="budget_balance")
+
+    relax = {}
+    if requirements in ("bb_ir", "bb_ir_relax"):
+        for i in ids:
+            if requirements == "bb_ir_relax":
+                relax[i] = m.addVar(lb=0.0, name=f"IR_relax[{i}]")
+            if how == "expectation":
+                m.addConstr(gp.quicksum(pi[s] * (phi[(s, i)] - R_s[(s, i)]) for s in S) <= relax.get(i, 0.0),
+                            name=f"IR[{i}]")
+            else:
+                m.addConstrs((phi[(s, i)] - R_s[(s, i)] <= relax.get(i, 0.0) for s in S), name=f"IR[{i}]")
+
+    if min_relax and requirements != "bb_ir_relax":
+        raise ValueError("min_relax requires requirements='bb_ir_relax'")
+    m.setObjective(gp.quicksum(relax.values()) if min_relax else expected_cost, GRB.MINIMIZE)
+    m.update()
+    return {"model": m, "x": x, "scenarios": S, "pi": pi, "ids": ids, "blocks": blocks, "kkt": kkt, "D": D,
+            "phi": phi, "pay": pay, "imp": imp, "exp": exp, "exceed": exceed, "grid": grid, "F": F, "cap": cap,
+            "relax": relax, "expected_cost": expected_cost, "requirements": requirements, "how": how}
+
+
+def solve_sdp(bundle, *, time_limit: float = 600, mip_gap: float = 1e-4, x_start=None, R_s: dict | None = None,
+              verbose: bool = False) -> dict:
+    """Solve an SDP model from build_sdp; return the prices, per-scenario results and the KKT residual checks.
+
+    x_start: optional 24 prices (e.g. the DP prices) given to Gurobi as a partial MIP start.
+    R_s: optional R costs per scenario, to report the members worse off than R in every scenario.
+    """
+    m = bundle["model"]
+    m.Params.OutputFlag = int(verbose)
+    m.Params.TimeLimit = float(time_limit)
+    m.Params.MIPGap = float(mip_gap)
+    if x_start is not None:
+        for t, v in enumerate(np.asarray(x_start, dtype=float)):
+            bundle["x"][t].Start = v
+    m.optimize()
+
+    status = {GRB.OPTIMAL: "OPTIMAL", GRB.INFEASIBLE: "INFEASIBLE", GRB.TIME_LIMIT: "TIME_LIMIT",
+              GRB.INF_OR_UNBD: "INF_OR_UNBD", GRB.UNBOUNDED: "UNBOUNDED"}.get(m.Status, str(m.Status))
+    out = {"status": status, "runtime_s": m.Runtime, "has_solution": m.SolCount > 0, "n_vars": m.NumVars,
+           "n_constrs": m.NumConstrs, "n_sos": m.NumSOS, "n_scenarios": len(bundle["scenarios"]),
+           "mip_gap": float(m.MIPGap) if m.SolCount else np.nan,
+           "best_bound": float(m.ObjBound) if m.Status in (GRB.OPTIMAL, GRB.TIME_LIMIT) else np.nan}
+    if not out["has_solution"]:
+        return out
+
+    T = range(len(bundle["x"]))
+    x = np.array([bundle["x"][t].X for t in T])
+    rows, max_pay, max_comp, max_stat = [], 0.0, 0.0, 0.0
+    for s in bundle["scenarios"]:
+        E = np.array([bundle["exceed"][s][t].X for t in T])
+        payments, worse, violation = 0.0, 0, 0.0
+        for i in bundle["ids"]:
+            k = (s, i)
+            q = np.array([bundle["blocks"][k]["q"][t].X for t in T])
+            pay = bundle["pay"][k].getValue()
+            payments += pay
+            max_pay = max(max_pay, abs(pay - x @ q))
+            max_comp = max([max_comp] + [abs(mu.X * sl.X) for mu, sl in bundle["kkt"][k]["pairs"]])
+            max_stat = max([max_stat] + [abs(c.Slack) for c in bundle["kkt"][k]["stations"]])
+            if R_s is not None:
+                gap = bundle["phi"][k].getValue() - R_s[k]
+                if gap > 1e-5:
+                    worse, violation = worse + 1, violation + gap
+        grid = bundle["grid"][s].getValue()
+        rows.append({"scenario": s, "probability": bundle["pi"][s], "welfare_cost_DKK": bundle["F"][s].getValue(),
+                     "grid_bill_DKK": grid, "surplus_DKK": payments - grid, "exceedance_kWh": E.sum(),
+                     "hours_above_cap": int((E > 1e-6).sum()),
+                     "n_worse_off_than_R": worse if R_s is not None else np.nan,
+                     "total_IR_violation_DKK": violation if R_s is not None else np.nan})
+    out.update({"x": x, "per_scenario": pd.DataFrame(rows), "expected_cost_DKK": bundle["expected_cost"].getValue(),
+                "solver_objective": m.ObjVal, "max_payment_gap": max_pay, "max_stationarity": max_stat,
+                "max_complementarity": max_comp})
+    return out
