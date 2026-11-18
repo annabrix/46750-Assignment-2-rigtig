@@ -367,7 +367,18 @@ def run_q3_baseline(com, out_dir: Path, n: int = 100, seed: int = 100) -> None:
     to their theta. Writes q3_scenarios_seed<seed>_theta.csv and q3_baseline_<scenario|member>.csv.
     """
     R = {d.consumer_id: FlexibleConsumerModel(d).build().solve().objective for d in com.members}
-    x = solve_dp(build_dp(com, "bb", R), time_limit=120)["hourly"].x.to_numpy()
+    dp = solve_dp(build_dp(com, "bb", R), time_limit=120)
+    x = dp["hourly"].x.to_numpy()
+
+    # theta = 1 for every member: the optimistic response must reproduce DP; the solver's arbitrary
+    base = draw_scenarios(com, n=1, seed=seed)
+    print(f"\nDP (budget balance): welfare cost {dp['objective_DKK']:.2f}, surplus {dp['budget_surplus_DKK']:.2f}")
+    print("Same prices with theta = 1 for every member:")
+    for tb in ("optimistic", "solver"):
+        r = evaluate_prices(com, x, base, tie_break=tb)[0].iloc[0]
+        print(f"  {tb:<10} welfare cost {r.welfare_cost_DKK:8.2f} | exceedance {r.exceedance_kWh:6.2f} kWh"
+              f" | surplus {r.surplus_DKK:8.2f} | members worse off than R {r.n_worse_off_than_R}")
+
     S = draw_scenarios(com, n=n, seed=seed)
 
     out_dir.mkdir(parents=True, exist_ok=True)
