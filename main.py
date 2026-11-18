@@ -17,6 +17,7 @@ from pathlib import Path
 from src.data_loader import load_community, list_communities
 from src.model import FlexibleConsumerModel
 from src.community_model import CommunityModel
+from src.dynamic_pricing import build_dp, solve_dp, solution_values
 
 import numpy as np
 import pandas as pd
@@ -257,6 +258,104 @@ def run_settlement(com, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     s.to_csv(out_dir / "settlement_members.csv", index=False)
 
+def run_q2_sensitivity(com, out_dir: Path, time_limit: float = 120) -> None:
+    """Q2 sensitivity on the discount beta: DP with the cap only and with budget balance, at every beta.
+
+    Reports per step: status (feasibility), efficiency loss against C at the same beta (DKK/day), the
+    manager's surplus (DKK/day), and the members worse off than in R, i.e. the members blocking
+    individual rationality, with their total loss (DKK/day). Writes q2_sensitivity_beta.csv.
+    """
+    ct = com.contract
+    betas = [0, 0.25, 0.5, 0.75, 1]
+    R = {d.consumer_id: FlexibleConsumerModel(d).build().solve().objective for d in com.members}
+
+    rows = []
+    for beta in betas:
+        C = CommunityModel(com.members, "C").build(pooled=True, discount=beta, cap_kW=ct.capacity_limit_kW,
+                                                   penalty=ct.penalty_DKK_per_kWh).solve()
+        for variant in ("cap", "bb"):
+            r = solve_dp(build_dp(com, variant, R, discount=beta, x_ub=None if variant == "cap" else np.inf), time_limit=time_limit)
+            row = {"beta": beta, "variant": variant, "status": r["status"], "C_cost_DKK": C.objective,
+                   "runtime_s": r["runtime_s"]}
+            if r["has_solution"]:
+                cost = r["members"].set_index("consumer_id").cost_DKK
+                loss = (cost - pd.Series(R)).clip(lower=0)
+                blocking = loss[loss > 1e-5]
+                row.update({"DP_cost_DKK": r["objective_DKK"],
+                            "efficiency_loss_DKK": r["objective_DKK"] - C.objective,
+                            "surplus_DKK": r["budget_surplus_DKK"],
+                            "n_worse_off_than_R": len(blocking),
+                            "total_IR_violation_DKK": blocking.sum(),
+                            "blocking_members": ",".join(blocking.index)})
+            rows.append(row)
+            print(f"beta={beta:<5} {variant:<4} {r['status']}")
+
+    df = pd.DataFrame(rows)
+    pd.set_option("display.width", 250)
+    print("\nQ2 sensitivity on the discount (DKK/day; efficiency loss against C at the same beta)")
+    print(df[["beta", "variant", "status", "efficiency_loss_DKK", "surplus_DKK", "n_worse_off_than_R",
+              "total_IR_violation_DKK", "blocking_members"]].round(2).to_string(index=False))
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_dir / "q2_sensitivity_beta.csv", index=False)
+
+def run_q2(com, out_dir: Path, time_limit: float = 120) -> None:
+    """Q2 base case: DP in three steps, cap only -> + budget balance -> + individual rationality.
+
+    Individual rationality (cost <= cost in R for every member) is tested through the IR relaxation:
+    budget balance is kept and the total IR violation is minimized, warm-started from the budget-balanced
+    solution. A total violation of 0 means that uniform prices meet both requirements.
+    Prints the comparison with C and the KKT residuals; writes DP_<variant>_hourly.csv,
+    DP_<variant>_members.csv and q2_overview.csv.
+    """
+    ct = com.contract
+    R = {d.consumer_id: FlexibleConsumerModel(d).build().solve().objective for d in com.members}
+    C = CommunityModel(com.members, "C").build(pooled=True, discount=ct.tariff_discount_ratio,
+                                               cap_kW=ct.capacity_limit_kW, penalty=ct.penalty_DKK_per_kWh).solve()
+
+    results, start = {}, None
+    for variant in ("cap", "bb"):
+        b = build_dp(com, variant, R, x_ub=None if variant == "cap" else np.inf)
+        results[variant] = r = solve_dp(b, time_limit=time_limit)
+        print(f"DP {variant:<12} {r['status']}")
+        if variant == "bb" and r["has_solution"]:
+            start = solution_values(b)
+            cost = r["members"].set_index("consumer_id").cost_DKK
+            start.update({f"IR_relax[{i}]": max(0.0, cost[i] - R[i]) for i in R})
+    results["bb_ir_relax"] = r = solve_dp(build_dp(com, "bb_ir_relax", R, min_relax=True),
+                                          time_limit=time_limit, start=start)
+    print(f"DP bb_ir_relax  {r['status']}")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for variant, r in results.items():
+        row = {"variant": variant, "status": r["status"], "runtime_s": r["runtime_s"],
+               "best_bound": r.get("best_bound")}
+        if r["has_solution"]:
+            if max(r["max_payment_gap"], r["max_stationarity"], r["max_complementarity"]) > 1e-4:
+                raise RuntimeError(f"KKT validation failed for DP {variant}")
+            members = r["members"]
+            members["cost_R_DKK"] = members.consumer_id.map(R)
+            members["gain_vs_R_DKK"] = members.cost_R_DKK - members.cost_DKK
+            losers = members.loc[members.gain_vs_R_DKK < -1e-5]
+            row.update({"welfare_DKK": r["objective_DKK"], "efficiency_loss_DKK": r["objective_DKK"] - C.objective,
+                        "surplus_DKK": r["budget_surplus_DKK"], "n_worse_off_than_R": len(losers),
+                        "total_IR_violation_DKK": -losers.gain_vs_R_DKK.sum(),
+                        "blocking_members": ",".join(losers.consumer_id),
+                        "max_KKT_residual": max(r["max_payment_gap"], r["max_stationarity"],
+                                                r["max_complementarity"])})
+            r["hourly"].to_csv(out_dir / f"DP_{variant}_hourly.csv", index=False)
+            members.to_csv(out_dir / f"DP_{variant}_members.csv", index=False)
+        rows.append(row)
+
+    overview = pd.DataFrame(rows)
+    overview.to_csv(out_dir / "q2_overview.csv", index=False)
+    pd.set_option("display.width", 250)
+    print(f"\nQ2 base case (DKK/day). C: {C.objective:.2f}; members' total cost in R: {sum(R.values()):.2f}")
+    print(overview.drop(columns=["blocking_members"], errors="ignore").round(4).to_string(index=False))
+    for row in rows:
+        if row.get("blocking_members"):
+            print(f"{row['variant']}: worse off than R -> {row['blocking_members']}")
 
 
 def main() -> None:
@@ -269,7 +368,9 @@ def main() -> None:
     ap.add_argument("--individual", action="store_true", help="Q1: solve model I and compare it with R")
     ap.add_argument("--central", action="store_true", help="Q1: solve model C (community contract) and compare with R and I")
     ap.add_argument("--sensitivity", action="store_true", help="Q1: sweep the discount and the cap tightness")
-    ap.add_argument("--settlement", action="store_true", help="Q1: settle C at the internal prices, test budget balance and IR")   
+    ap.add_argument("--settlement", action="store_true", help="Q1: settle C at the internal prices, test budget balance and IR")
+    ap.add_argument("--q2-sensitivity", action="store_true", help="Q2: DP (cap, budget balance) over the discount; blocking members")
+    ap.add_argument("--q2", action="store_true", help="Q2: DP on the base case, cap -> budget balance -> IR")
     
     
     args = ap.parse_args()
@@ -297,6 +398,10 @@ def main() -> None:
         run_sensitivity(com, RESULTS_DIR / args.community / args.day)
     if args.settlement:
         run_settlement(com, RESULTS_DIR / args.community / args.day)
+    if args.q2_sensitivity:
+        run_q2_sensitivity(com, RESULTS_DIR / args.community / args.day / "Q2")
+    if args.q2:
+        run_q2(com, RESULTS_DIR / args.community / args.day / "Q2")
 
 
 
