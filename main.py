@@ -18,7 +18,7 @@ from src.data_loader import load_community, list_communities
 from src.model import FlexibleConsumerModel
 from src.community_model import CommunityModel
 from src.dynamic_pricing import build_dp, solve_dp, solution_values
-from src.stochastic_pricing import draw_scenarios, evaluate_prices
+from src.stochastic_pricing import draw_scenarios, evaluate_prices, StochasticDP
 
 import numpy as np
 import pandas as pd
@@ -400,8 +400,76 @@ def run_q3_baseline(com, out_dir: Path, n: int = 100, seed: int = 100) -> None:
     for _, w in per_s.nlargest(3, "welfare_cost_DKK").iterrows():
         th = per_m[per_m.scenario == w.scenario].nsmallest(4, "theta")
         print(f"  scenario {int(w.scenario)}: cost {w.welfare_cost_DKK:.2f}, exceedance {w.exceedance_kWh:.2f} kWh, "
-              f"surplus {w.surplus_DKK:.2f} | " + ", ".join(f"{r.consumer_id} {r.theta:.2f}" for r in th.itertuples()))
-        
+              f"surplus {w.surplus_DKK:.2f} | " + ", ".join(f"{r.consumer_id} {r.theta:.2f}" for r in th.itertuples()))     
+
+def _q3_summary(per_s: pd.DataFrame, label: str) -> dict:
+    """Metrics of one set of evaluated scenarios: the cost as a distribution (mean, 95% quantile, CVaR95 = mean of
+    the worst 5%), cap and budget satisfaction (frequency and magnitude), and individual rationality."""
+    c = per_s.welfare_cost_DKK
+    worst = c.nlargest(max(1, int(np.ceil(0.05 * len(c)))))
+    return {"case": label, "scenarios": len(per_s),
+            "mean_cost_DKK": c.mean(), "q95_cost_DKK": c.quantile(0.95), "CVaR95_cost_DKK": worst.mean(),
+            "P_exceed_%": 100 * (per_s.exceedance_kWh > 1e-6).mean(),
+            "mean_exceed_kWh": per_s.exceedance_kWh.mean(), "max_exceed_kWh": per_s.exceedance_kWh.max(),
+            "P_deficit_%": 100 * (per_s.surplus_DKK < -1e-4).mean(),
+            "mean_surplus_DKK": per_s.surplus_DKK.mean(), "worst_deficit_DKK": max(0.0, -per_s.surplus_DKK.min()),
+            "mean_worse_off": per_s.n_worse_off_than_R.mean(),
+            "mean_IR_violation_DKK": per_s.total_IR_violation_DKK.mean()}
+
+
+def run_q3_sdp(com, out_dir: Path, n: int = 5, seed: int = 1, n_out: int = 100, seed_out: int = 100,
+               time_limit: float = 300, resolve: bool = False) -> None:
+    """Q3: the base stochastic model SDP^E (expected cost, budget balance in expectation) against the deterministic
+    baseline DP, evaluated on the n in-sample scenarios (seed) and on n_out out-of-sample scenarios (seed_out).
+
+    The SDP^E prices are solved once and saved (SDP_E_N<n>_seed<seed>_prices.csv, with the solve details in
+    ..._solve.csv); later runs reload them unless resolve=True. Prints and writes the comparison table.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tag = f"SDP_E_N{n}_seed{seed}"
+    R = {d.consumer_id: FlexibleConsumerModel(d).build().solve().objective for d in com.members}
+    x_dp = solve_dp(build_dp(com, "bb", R), time_limit=120)["hourly"].x.to_numpy()
+    S_in = draw_scenarios(com, n=n, seed=seed)
+    S_out = draw_scenarios(com, n=n_out, seed=seed_out)
+    pd.DataFrame([{"scenario": s["id"], **s["theta"]["profile"]} for s in S_in]).to_csv(
+        out_dir / f"q3_scenarios_seed{seed}_N{n}_theta.csv", index=False)
+
+    f = out_dir / f"{tag}_prices.csv"
+    if f.exists() and not resolve:
+        x_sdp = pd.read_csv(f).x.to_numpy()
+        print(f"\nLoaded the {tag} prices from {f.name} (add --q3-resolve to solve again)")
+    else:
+        print(f"\nSolving {tag} (time limit {time_limit:.0f} s) ...")
+        r = StochasticDP(com, S_in).build(budget="expectation").solve(time_limit=time_limit, x_start=x_dp)
+        if not r["has_solution"]:
+            raise RuntimeError(f"{tag}: no solution ({r['status']})")
+        if r["max_KKT_residual"] > 1e-4:
+            raise RuntimeError(f"{tag}: KKT validation failed")
+        x_sdp = r["x"]
+        keys = ("status", "N", "runtime_s", "mip_gap", "best_bound", "expected_cost_DKK", "max_KKT_residual",
+                "n_vars", "n_constrs", "n_sos")
+        pd.DataFrame([{k: r[k] for k in keys}]).to_csv(out_dir / f"{tag}_solve.csv", index=False)
+        pd.DataFrame({"hour": range(len(x_sdp)), "x": x_sdp, "x_DP": x_dp}).to_csv(f, index=False)
+        print(f"{tag}: {r['status']}, expected cost {r['expected_cost_DKK']:.2f}, gap {100 * r['mip_gap']:.3f}%, "
+              f"{r['runtime_s']:.0f} s, {r['n_vars']} variables, {r['n_sos']} SOS pairs")
+
+    diff = np.flatnonzero(np.abs(x_sdp - x_dp) > 1e-3)
+    print("Hours where SDP^E and DP prices differ:",
+          ", ".join(f"h{t}: {x_dp[t]:.2f} -> {x_sdp[t]:.2f}" for t in diff) or "none")
+
+    rows = []
+    for model, x in (("DP", x_dp), ("SDP^E", x_sdp)):
+        for set_name, S in (("in-sample", S_in), ("out-of-sample", S_out)):
+            print(f"Evaluating {model} {set_name} ({len(S)} scenarios) ...")
+            per_s, _ = evaluate_prices(com, x, S)
+            per_s.to_csv(out_dir / f"q3_eval_{model.replace('^', '')}_{tag}_{set_name}.csv", index=False)
+            rows.append(_q3_summary(per_s, f"{model} {set_name}"))
+    table = pd.DataFrame(rows).set_index("case").T
+    table.to_csv(out_dir / f"q3_compare_{tag}.csv")
+    pd.set_option("display.width", 250)
+    print(f"\nDP vs SDP^E (N = {n}, seed {seed}); out-of-sample: {n_out} scenarios, seed {seed_out}")
+    print(table.round(2).to_string())
+    
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--community", default="base", help=f"base (shipped) or your own params_community_<name>.json; available: {list_communities()}")
@@ -415,9 +483,9 @@ def main() -> None:
     ap.add_argument("--settlement", action="store_true", help="Q1: settle C at the internal prices, test budget balance and IR")
     ap.add_argument("--q2-sensitivity", action="store_true", help="Q2: DP (cap, budget balance) over the discount; blocking members")
     ap.add_argument("--q2", action="store_true", help="Q2: DP on the base case, cap -> budget balance -> IR")
-    ap.add_argument("--q3-baseline", action="store_true", help="Q3: deterministic DP prices on 100 out-of-sample scenarios")
-    
-    
+    ap.add_argument("--q3-baseline", action="store_true", help="Q3: deterministic DP prices on 100 out-of-sample scenarios")    
+    ap.add_argument("--q3-sdp", action="store_true", help="Q3: SDP^E vs DP, in-sample and out-of-sample")
+        
     args = ap.parse_args()
 
     com = load_community(args.community, day=args.day)
@@ -449,7 +517,8 @@ def main() -> None:
         run_q2(com, RESULTS_DIR / args.community / args.day / "Q2")
     if args.q3_baseline:
         run_q3_baseline(com, RESULTS_DIR / args.community / args.day / "Q3")
-
+    if args.q3_sdp:
+        run_q3_sdp(com, RESULTS_DIR / args.community / args.day / "Q3")
 
 
 if __name__ == "__main__":
