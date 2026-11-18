@@ -116,7 +116,7 @@ def add_kkt(m, block, x, tag: str) -> dict:
     return {"phi": phi, "pairs": pairs, "stations": stations}
 
 def build_dp(com, variant: str = "cap", R: dict | None = None, *, discount: float | None = None, cap=None,
-             x_lb=0.0, x_ub=None, min_relax: bool = False, end_soc: str = "initial",
+             x_lb=0.0, x_ub=np.inf, min_relax: bool = False, end_soc: str = "initial",
              verbose: bool = False) -> dict:
     """Single-level MILP of DP: the manager's problem with every member's LP replaced by its KKT conditions.
 
@@ -127,9 +127,6 @@ def build_dp(com, variant: str = "cap", R: dict | None = None, *, discount: floa
         bb_ir        + individual rationality: every member's cost <= its cost in R (dict R, DKK)
         bb_ir_relax  as bb_ir, but member i may violate IR by IR_relax[i] >= 0 (DKK)
     min_relax: objective = total IR relaxation instead of welfare (only with bb_ir_relax).
-    Price bounds (DKK/kWh): x_lb <= x_t <= x_ub. Defaults: 0 (no negative price, which would let batteries
-    profit from charging and discharging at once) and, per hour, the discounted import price + penalty
-    (the cost of a kWh above the cap). Pass x_lb=-np.inf, x_ub=np.inf for unbounded prices.
     """
     if variant not in ("cap", "bb", "bb_ir", "bb_ir_relax"):
         raise ValueError(f"Unknown variant {variant!r}")
