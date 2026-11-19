@@ -424,10 +424,14 @@ def _sdp_solve_or_load(com, S_in, label: str, params: dict, tag: str, out_dir: P
     if f_x.exists() and f_info.exists() and not resolve:
         print(f"Loaded the {label} prices from {f_x.name} (add --q3-resolve to solve again)")
         return pd.read_csv(f_x).x.to_numpy(), {**pd.read_csv(f_info).iloc[0].to_dict(), "model": label}
+    if f_x.exists():                         # resolving: start from this model's previous solution
+        x_start = pd.read_csv(f_x).x.to_numpy()
     print(f"Solving {label} ({tag}, time limit {time_limit:.0f} s) ...")
     r = StochasticDP(com, S_in).build(**params).solve(time_limit=time_limit, x_start=x_start)
     if not r["has_solution"]:
-        raise RuntimeError(f"{tag}: no solution ({r['status']})")
+        print(f"  {label}: no solution within {time_limit:.0f} s ({r['status']}); skipped")
+        return None, {"model": label, "status": r["status"], "N": r["N"], "runtime_s": r["runtime_s"],
+                      "n_vars": r["n_vars"], "n_sos": r["n_sos"]}
     if r["max_KKT_residual"] > 1e-4:
         raise RuntimeError(f"{tag}: KKT validation failed")
     keys = ("status", "N", "runtime_s", "mip_gap", "best_bound", "objective_DKK", "expected_cost_DKK",
@@ -465,7 +469,59 @@ def run_q3_validate(com, n: int = 2, seed: int = 1, time_limit: float = 120) -> 
     print("Predicted ordering (variants >= SDP^b in expected cost):",
         all(df.loc[k, "expected_cost_DKK"] >= base - tol for k in ("SDP^CVaR beta_r=0.5", "SDP^CC eps=0")))
     
-    
+def run_q3_sdp(com, out_dir: Path, models=("b", "cvar", "cc"), n: int = 5, seed: int = 1, n_out: int = 100,
+               seed_out: int = 100, time_limit: float = 300, resolve: bool = False,
+               alpha: float = 0.2, beta_r: float = 0.5, eps: float = 0.2, deficit_tol: float = 0.0) -> None:
+    """Q3: the stochastic models against the deterministic baseline DP, in-sample and out-of-sample.
+
+    models: any of "b" (SDP^b: expected cost, budget balance in expectation), "cvar" (SDP^CVaR: weight beta_r on
+    the CVaR of the worst alpha fraction of scenarios) and "cc" (SDP^CC: no deficit with probability >= 1 - eps).
+    Each model is solved once on the n in-sample scenarios (seed) and its prices are saved; later runs reload them
+    unless resolve=True. All price vectors are evaluated on the in-sample scenarios and on the same n_out
+    out-of-sample scenarios (seed_out). Prints and writes the solve details and the comparison table.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    configs = {"b": ("SDP^b", "SDP_b", {}),
+               "cvar": ("SDP^CVaR", f"SDP_CVaR_a{alpha:g}_b{beta_r:g}",
+                        {"objective": "cvar", "alpha": alpha, "beta_r": beta_r}),
+               "cc": ("SDP^CC", f"SDP_CC_eps{eps:g}_tol{deficit_tol:g}",
+                      {"budget": "chance", "eps": eps, "deficit_tol": deficit_tol})}
+    R = {d.consumer_id: FlexibleConsumerModel(d).build().solve().objective for d in com.members}
+    x_dp = solve_dp(build_dp(com, "bb", R), time_limit=120)["hourly"].x.to_numpy()
+    S_in = draw_scenarios(com, n=n, seed=seed)
+    S_out = draw_scenarios(com, n=n_out, seed=seed_out)
+    pd.DataFrame([{"scenario": s["id"], **s["theta"]["profile"]} for s in S_in]).to_csv(
+        out_dir / f"q3_scenarios_seed{seed}_N{n}_theta.csv", index=False)
+
+    prices, infos = {"DP": x_dp}, []
+    for key in models:
+        label, name, params = configs[key]
+        tag = f"{name}_N{n}_seed{seed}"
+        x_start = prices.get("SDP^b", x_dp)          # the variants start from the SDP^b prices
+        x, info = _sdp_solve_or_load(com, S_in, label, params, tag, out_dir, x_start, time_limit, resolve)
+        infos.append(info)
+        if x is None:                        # no solution found: reported in the solve details, not evaluated
+            continue
+        prices[label] = x
+        diff = np.flatnonzero(np.abs(x - x_dp) > 1e-3)
+        print(f"  {label} vs DP prices: " + (", ".join(f"h{t} {x_dp[t]:.2f}->{x[t]:.2f}" for t in diff) or "same"))
+
+    pd.set_option("display.width", 250)
+    print(f"\nSolve details (N = {n}, seed {seed})")
+    print(pd.DataFrame(infos).round(4).to_string(index=False))
+
+    rows = []
+    for label, x in prices.items():
+        for set_name, S in (("in", S_in), ("out", S_out)):
+            print(f"Evaluating {label} {set_name}-sample ({len(S)} scenarios) ...")
+            per_s, _ = evaluate_prices(com, x, S)
+            per_s.to_csv(out_dir / f"q3_eval_{label.replace('^', '_')}_N{n}_seed{seed}_{set_name}.csv", index=False)
+            rows.append(_q3_summary(per_s, f"{label} {set_name}"))
+    table = pd.DataFrame(rows).set_index("case").T
+    table.to_csv(out_dir / f"q3_compare_N{n}_seed{seed}.csv")
+    print(f"\nModels in-sample (N = {n}, seed {seed}) and out-of-sample ({n_out} scenarios, seed {seed_out})")
+    print(table.round(2).to_string())
+        
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--community", default="base", help=f"base (shipped) or your own params_community_<name>.json; available: {list_communities()}")
@@ -486,7 +542,11 @@ def main() -> None:
     ap.add_argument("--q3-beta-r", type=float, default=0.5, help="Q3: CVaR weight in the objective")
     ap.add_argument("--q3-eps", type=float, default=0.2, help="Q3: accepted deficit probability in SDP^CC")
     ap.add_argument("--q3-validate", action="store_true", help="Q3: validate the variants on 2 scenarios")
-
+    ap.add_argument("--q3-n", type=int, default=5, help="Q3: number of in-sample scenarios N")
+    ap.add_argument("--q3-seed", type=int, default=1, help="Q3: seed of the in-sample scenarios")
+    ap.add_argument("--q3-time-limit", type=float, default=300, help="Q3: time limit of each SDP solve (s)")
+    ap.add_argument("--q3-resolve", action="store_true", help="Q3: solve the SDP models again even if their prices are saved")
+    ap.add_argument("--q3-deficit-tol", type=float, default=0.0, help="Q3: deficit tolerated in SDP^CC (DKK/day)")
 
         
     args = ap.parse_args()
@@ -523,7 +583,8 @@ def main() -> None:
     if args.q3_sdp:
         run_q3_sdp(com, RESULTS_DIR / args.community / args.day / "Q3", models=args.q3_models.split(","),
                    n=args.q3_n, seed=args.q3_seed, time_limit=args.q3_time_limit, resolve=args.q3_resolve,
-                   alpha=args.q3_alpha, beta_r=args.q3_beta_r, eps=args.q3_eps)
+                   alpha=args.q3_alpha, beta_r=args.q3_beta_r, eps=args.q3_eps, deficit_tol=args.q3_deficit_tol)
+
     if args.q3_validate:
         run_q3_validate(com)
 
