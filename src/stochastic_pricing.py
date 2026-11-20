@@ -165,6 +165,9 @@ class StochasticDP:
                              scenarios (SDP^CC; one binary per scenario, big-M = big_m DKK)
         ir         "none" | "expectation" | "scenario": member cost <= its cost in R on the same scenario data
         x_lb, x_ub price bounds (DKK/kWh), default x >= 0 without upper bound, as in DP
+        reg        weight of a small regularization term: reg * expected |surplus|. The cost does not depend on the
+                   price level, so many price vectors are optimal; the term picks the one with the most stable
+                   budget among them (default 1e-3 DKK per DKK, negligible against the cost)
     """
 
     def __init__(self, com, scenarios: list[dict], *, R: dict | None = None, name: str = "SDP"):
@@ -182,7 +185,8 @@ class StochasticDP:
         return self.R
 
     def build(self, *, objective: str = "expected", budget: str = "expectation", ir: str = "none",
-              alpha: float = 0.2, beta_r: float = 0.5, eps: float = 0.2, big_m: float = 50.0,
+              alpha: float = 0.2, beta_r: float = 0.5, eps: float = 0.2, big_m: float = 50.0, reg: float = 1e-3,
+              deficit_tol: float = 0.0,
               x_lb=0.0, x_ub=np.inf, discount: float | None = None, cap=None,
               verbose: bool = False) -> "StochasticDP":
         if objective not in ("expected", "cvar"):
@@ -234,7 +238,7 @@ class StochasticDP:
             # expected balance, and a deficit allowed only in scenarios with v_s = 1, at most eps of them
             m.addConstr(gp.quicksum(self.pi[s] * surplus[s] for s in S) == 0, name="budget_balance_expected")
             v_def = {s: m.addVar(vtype=GRB.BINARY, name=f"deficit_allowed[{s}]") for s in S}
-            m.addConstrs((surplus[s] >= -big_m * v_def[s] for s in S), name="no_deficit")
+            m.addConstrs((surplus[s] >= -deficit_tol - big_m * v_def[s] for s in S), name="no_deficit")
             m.addConstr(gp.quicksum(self.pi[s] * v_def[s] for s in S) <= eps + 1e-9, name="deficit_probability")
 
         # individual rationality against R on the same scenario data
@@ -248,6 +252,11 @@ class StochasticDP:
                 m.addConstrs((phi[s][i] <= R[(s, i)] for s in S for i in ids), name="IR")
 
         expected_cost = gp.quicksum(self.pi[s] * cost[s] for s in S)
+        # regularization: |surplus_s| <= dev_s, so that among equally cheap prices the most stable budget is chosen
+        dev = {s: m.addVar(lb=0.0, name=f"surplus_dev[{s}]") for s in S}
+        m.addConstrs((dev[s] >= surplus[s] for s in S), name="dev_pos")
+        m.addConstrs((dev[s] >= -surplus[s] for s in S), name="dev_neg")
+        regularization = reg * gp.quicksum(self.pi[s] * dev[s] for s in S)
         zeta, eta, cvar = None, {}, None
         if objective == "cvar":
             # linear CVaR (Rockafellar-Uryasev): zeta = VaR threshold, eta_s = cost of scenario s above it
@@ -255,38 +264,53 @@ class StochasticDP:
             eta = {s: m.addVar(lb=0.0, name=f"eta[{s}]") for s in S}
             m.addConstrs((eta[s] >= cost[s] - zeta for s in S), name="cvar")
             cvar = zeta + (1.0 / alpha) * gp.quicksum(self.pi[s] * eta[s] for s in S)
-            m.setObjective((1 - beta_r) * expected_cost + beta_r * cvar, GRB.MINIMIZE)
+            m.setObjective((1 - beta_r) * expected_cost + beta_r * cvar + regularization, GRB.MINIMIZE)
         else:
-            m.setObjective(expected_cost, GRB.MINIMIZE)
+            m.setObjective(expected_cost + regularization, GRB.MINIMIZE)
         m.update()
         self.m, self.x, self.T, self.cap = m, x, T, cap
         self.v = {"blocks": blocks, "kkt": kkt, "phi": phi, "D": D, "pay": pay, "grid": grid, "cost": cost,
                   "imp": imp, "exp": exp, "exc": exc, "surplus": surplus, "expected_cost": expected_cost,
                   "cvar": cvar, "v_def": v_def}
-        self.settings = {"objective": objective, "budget": budget, "ir": ir}
+        self.settings = {"objective": objective, "budget": budget, "ir": ir, "reg": reg}
         if objective == "cvar":
             self.settings.update(alpha=alpha, beta_r=beta_r)
         if budget == "chance":
-            self.settings.update(eps=eps, big_m=big_m)
+            self.settings.update(eps=eps, big_m=big_m, deficit_tol=deficit_tol)
         return self
 
     def solve(self, *, time_limit: float = 300, mip_gap: float = 1e-4, x_start=None,
               verbose: bool = False) -> dict:
         """Solve and return the prices, the per-scenario results, the KKT residuals and the model size.
 
-        x_start: optional 24 prices (e.g. the DP prices) given to Gurobi as a partial MIP start.
+        x_start: optional 24 prices (e.g. of DP or SDP^b). The model is first solved with the prices fixed to
+        x_start (the members' responses only, which is fast), and that solution is the MIP start of the full solve.
         """
         m, T, v = self.m, self.T, self.v
         m.Params.OutputFlag = int(verbose)
-        m.Params.TimeLimit = float(time_limit)
         m.Params.MIPGap = float(mip_gap)
+        start_time = 0.0
         if x_start is not None:
+            bounds = [(self.x[t].LB, self.x[t].UB) for t in T]
             for t in T:
-                self.x[t].Start = float(x_start[t])
+                self.x[t].LB = self.x[t].UB = float(x_start[t])
+            m.Params.TimeLimit = min(120.0, float(time_limit))
+            m.optimize()
+            start_time = m.Runtime
+            values = [(var, var.X) for var in m.getVars()] if m.SolCount else []
+            for t in T:
+                self.x[t].LB, self.x[t].UB = bounds[t]
+            m.reset(0)
+            for var, val in values:
+                var.Start = val
+            if not values:                   # fixed prices infeasible (e.g. budget): give the prices as a partial start
+                for t in T:
+                    self.x[t].Start = float(x_start[t])
+        m.Params.TimeLimit = float(time_limit)
         m.optimize()
         status = {GRB.OPTIMAL: "OPTIMAL", GRB.INFEASIBLE: "INFEASIBLE", GRB.TIME_LIMIT: "TIME_LIMIT",
                   GRB.INF_OR_UNBD: "INF_OR_UNBD"}.get(m.Status, str(m.Status))
-        out = {"status": status, **self.settings, "N": len(self.members), "runtime_s": m.Runtime,
+        out = {"status": status, **self.settings, "N": len(self.members), "runtime_s": start_time + m.Runtime,
                "n_vars": m.NumVars, "n_constrs": m.NumConstrs, "n_sos": m.NumSOS,
                "has_solution": m.SolCount > 0, "mip_gap": float(m.MIPGap) if m.SolCount else np.nan,
                "best_bound": float(m.ObjBound) if m.Status in (GRB.OPTIMAL, GRB.TIME_LIMIT) else np.nan}

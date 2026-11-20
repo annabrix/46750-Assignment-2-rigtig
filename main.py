@@ -17,14 +17,11 @@ from pathlib import Path
 from src.data_loader import load_community, list_communities
 from src.model import FlexibleConsumerModel
 from src.community_model import CommunityModel
-from src.dynamic_pricing import build_dp, solve_dp, solution_values, best_response
-from src.community_model import add_member_block
-from src.stochastic_pricing import draw_scenarios, evaluate_prices, StochasticDP, respond, scenario_members
+from src.dynamic_pricing import build_dp, solve_dp, solution_values
+from src.stochastic_pricing import draw_scenarios, evaluate_prices, StochasticDP
 
-import gurobipy as gp
 import numpy as np
 import pandas as pd
-from gurobipy import GRB
 
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
@@ -432,203 +429,36 @@ def _q3_summary(per_s: pd.DataFrame, label: str) -> dict:
             "mean_IR_violation_DKK": per_s.total_IR_violation_DKK.mean()}
 
 
-def _optimistic_primal(com, members, x, tol: float = 1e-9) -> dict:
-    """The members' optimistic responses to fixed prices x on one scenario (as respond in stochastic_pricing, with a
-    tighter tie tolerance), returning every primal value: each member's variables by family (load, dev_up, dev_dn,
-    pv, q, charge, discharge, soc), the community's import, export and exceedance (kW), the welfare cost and the
-    manager's surplus (payments x.q minus the grid bill, DKK)."""
-    ct, d0 = com.contract, com.members[0]
-    beta, pen = ct.tariff_discount_ratio, ct.penalty_DKK_per_kWh
-    p = np.asarray(d0.energy_price, dtype=float)
-    T = range(len(p))
-    cap = np.broadcast_to(np.asarray(ct.capacity_limit_kW, dtype=float), (len(T),))
-    a, b = p + (1 - beta) * d0.import_tariff, p - (1 - beta) * d0.export_tariff
-    br = {d.consumer_id: best_response(d, x)["cost"] for d in members}
-    mdl = gp.Model("optimistic_primal")
-    mdl.Params.OutputFlag = 0
-    blocks = {d.consumer_id: add_member_block(mdl, d, d.consumer_id) for d in members}
-    for i, blk in blocks.items():
-        own = gp.quicksum(x[t] * blk["q"][t] for t in T) + blk["disutility"] + blk["pv_cost"]
-        mdl.addConstr(own <= br[i] + tol * max(1.0, abs(br[i])))
-    imp, exp, exc = mdl.addVars(T), mdl.addVars(T), mdl.addVars(T)
-    mdl.addConstrs(imp[t] - exp[t] == gp.quicksum(blk["q"][t] for blk in blocks.values()) for t in T)
-    mdl.addConstrs(imp[t] - exc[t] <= cap[t] for t in T)
-    grid = gp.quicksum(a[t] * imp[t] - b[t] * exp[t] + pen * exc[t] for t in T)
-    D = gp.quicksum(blk["disutility"] + blk["pv_cost"] for blk in blocks.values())
-    mdl.setObjective(grid + D, GRB.MINIMIZE)
-    mdl.optimize()
-    if mdl.Status != GRB.OPTIMAL:
-        raise RuntimeError(f"optimistic response ended with status {mdl.Status}")
-    vals = {i: {f: np.array([blk["var"][f][t].X for t in T]) for f in blk["var"]} for i, blk in blocks.items()}
-    pay = sum(float(x @ v["q"]) for v in vals.values())
-    return {"members": vals, "imp": np.array([imp[t].X for t in T]), "exp": np.array([exp[t].X for t in T]),
-            "exc": np.array([exc[t].X for t in T]), "cost": mdl.ObjVal, "surplus": pay - grid.getValue()}
-
-
-def _budget_balanced_shift(com, S_in, x0, tol: float = 1e-8, max_iter: int = 80):
-    """One constant c (DKK/kWh, the same in every hour) such that the prices x0 + c balance the manager's budget in
-    expectation on the scenarios S_in, with the members' optimistic responses. The expected surplus is piecewise
-    linear and increasing in c for a net-importing community (slope ~ the expected net import), so a bracketing
-    search with secant steps finds its root. Returns (x0 + c, c, responses per scenario) or (None, None, None)."""
-    scen = [(s["id"], float(s["probability"]), scenario_members(com, s)) for s in S_in]
-
-    def evaluate(c):
-        resp = {sid: _optimistic_primal(com, ms, x0 + c) for sid, _, ms in scen}
-        return sum(p * resp[sid]["surplus"] for sid, p, _ in scen), resp
-
-    f0, r0 = evaluate(0.0)
-    if abs(f0) < tol:
-        return x0.copy(), 0.0, r0
-    lo, flo, step = 0.0, f0, 0.02 if f0 < 0 else -0.02
-    hi = step
-    fhi, _ = evaluate(hi)
-    while np.sign(fhi) == np.sign(flo):
-        lo, flo, step = hi, fhi, 2 * step
-        if abs(step) > 5 or np.min(x0 + hi + step) < 0:
-            return None, None, None
-        hi = hi + step
-        fhi, _ = evaluate(hi)
-    for _ in range(max_iter):
-        c = hi - fhi * (hi - lo) / (fhi - flo)                  # secant step (exact on a linear piece)
-        if not (min(lo, hi) < c < max(lo, hi)):
-            c = 0.5 * (lo + hi)
-        fc, rc = evaluate(c)
-        if abs(fc) < tol:
-            return x0 + c, c, rc
-        if np.sign(fc) == np.sign(flo):
-            lo, flo = c, fc
-        else:
-            hi, fhi = c, fc
-        if abs(hi - lo) < 1e-12:
-            break
-    return None, None, None
-
-
-def _complete_start(sdp, com, S_in, x0, time_limit: float, verbose: bool) -> bool:
-    """Give Gurobi a complete feasible MIP start for an SDP with budget balance in expectation.
-
-    1. The Q2 prices x0 balance the budget only at theta = 1, so they are shifted by one constant until the members'
-       optimistic responses balance the budget in expectation on the in-sample scenarios (_budget_balanced_shift).
-       These prices and responses are feasible for the SDP by construction: sdp.start_solution keeps them, so the
-       solve can fall back on them if Gurobi finds nothing better.
-    2. In the SDP, the prices are fixed and every complementarity pair is decided by the responses (a zero slack is
-       fixed at zero, otherwise its multiplier is), so what is left is an LP; all its values become the MIP start.
-    Returns True if the complete start was set."""
-    import time
-    t0 = time.time()
-    xb, c, resp = _budget_balanced_shift(com, S_in, x0)
-    if xb is None:
-        print("  start: no constant price shift balances the budget; solving without a start")
-        return False
-    exp_cost = sum(sdp.pi[sid] * resp[sid]["cost"] for sid in resp)
-    sdp.start_solution = {"x": np.asarray(xb, dtype=float), "expected_cost_DKK": exp_cost, "shift": c}
-    print(f"  start: Q2 prices shifted by {c:+.4f} DKK/kWh balance the budget in expectation; expected cost "
-          f"{exp_cost:.2f} DKK ({time.time() - t0:.0f} s)")
-
-    # Fix the prices and decide every complementarity pair from the responses: a slack that is zero (within 1e-7) at
-    # the responses is fixed at zero, otherwise its multiplier is. The SOS pairs then hold by construction and what
-    # is left (schedules, multipliers, grid flows) is an LP that the responses and their LP duals satisfy.
-    m, T, V = sdp.m, sdp.T, sdp.v
-    value = {}
-    for sid, r in resp.items():
-        for i, fams in r["members"].items():
-            for f, arr in fams.items():
-                for t in T:
-                    value[V["blocks"][sid][i]["var"][f][t].index] = float(arr[t])
-    define = {c.ConstrName: c for c in m.getConstrs() if c.ConstrName.startswith("define_slack[")}
-    fixed = [(sdp.x[t], float(xb[t]), float(xb[t])) for t in T]
-    for sid in resp:
-        for i, k in V["kkt"][sid].items():
-            for mu, sl in k["pairs"]:
-                row = define["define_" + sl.VarName]
-                expr = m.getRow(row)
-                a_s, rest = 0.0, 0.0
-                for j in range(expr.size()):
-                    v, a = expr.getVar(j), expr.getCoeff(j)
-                    if v.sameAs(sl):
-                        a_s += a
-                    else:
-                        rest += a * value[v.index]
-                slack = (row.RHS - rest) / a_s
-                fixed.append((sl, 0.0, 0.0) if slack <= 1e-7 else (mu, 0.0, 0.0))
-    bounds = [(v.LB, v.UB) for v, _, _ in fixed]
-    for v, lb, ub in fixed:
-        v.LB, v.UB = lb, ub
-    m.Params.OutputFlag = int(verbose)
-    m.Params.TimeLimit = min(300.0, 0.3 * time_limit)
-    m.optimize()
-    values = {v: v.X for v in m.getVars()} if m.SolCount > 0 else None
-    for (v, _, _), (lb, ub) in zip(fixed, bounds):
-        v.LB, v.UB = lb, ub
-    m.reset(0)
-    if values is None:
-        print(f"  start: the KKT multipliers could not be completed (status {m.Status}); solving with the prices "
-              f"as a partial start ({time.time() - t0:.0f} s)")
-        for t in T:
-            sdp.x[t].Start = float(xb[t])
-        return False
-    for v, val in values.items():
-        v.Start = val
-    print(f"  start: complete MIP start set ({time.time() - t0:.0f} s)")
-    return True
-
-
 def _sdp_solve_or_load(com, S_in, label: str, params: dict, tag: str, out_dir: Path, x_start,
-                       time_limit: float, resolve: bool, verbose: bool = False, plain: bool = False):
+                       time_limit: float, resolve: bool, verbose: bool = False):
     """Solve one SDP variant on the in-sample scenarios and save its prices and solve details, or reload them.
-    verbose=True prints the Gurobi log (incumbent, bound and gap as the solve progresses)."""
+
+    StochasticDP.solve first solves the model with the prices fixed to x_start and uses that as the MIP start.
+    When resolving, the model starts from its own previous solution. Returns (prices, solve details); the prices
+    are None if no solution was found in the time limit (the model is then reported but not evaluated).
+    verbose=True prints the Gurobi log."""
     f_x, f_info = out_dir / f"{tag}_prices.csv", out_dir / f"{tag}_solve.csv"
     if f_x.exists() and f_info.exists() and not resolve:
         print(f"Loaded the {label} prices from {f_x.name} (add --q3-resolve to solve again)")
         return pd.read_csv(f_x).x.to_numpy(), {**pd.read_csv(f_info).iloc[0].to_dict(), "model": label}
+    if f_x.exists():                         # resolving: start from this model's previous solution
+        x_start = pd.read_csv(f_x).x.to_numpy()
     print(f"Solving {label} ({tag}, time limit {time_limit:.0f} s) ...")
-    sdp = StochasticDP(com, S_in).build(**params)
-    if plain:
-        # Gurobi defaults with the Q2 prices as a partial start: exactly the setup of the first SDP run (6b5847a)
-        r = sdp.solve(time_limit=time_limit, x_start=x_start, verbose=verbose)
-        if not r["has_solution"]:
-            raise RuntimeError(f"{tag}: no solution ({r['status']}) - try without --q3-plain")
-        if r["max_KKT_residual"] > 1e-4:
-            raise RuntimeError(f"{tag}: KKT validation failed")
-        keys = ("status", "N", "runtime_s", "mip_gap", "best_bound", "objective_DKK", "expected_cost_DKK",
-                "max_KKT_residual", "n_vars", "n_constrs", "n_sos")
-        info = {"model": label, **{k: r[k] for k in keys}, "start_s": 0.0}
-        pd.DataFrame([info]).to_csv(f_info, index=False)
-        pd.DataFrame({"hour": range(len(r["x"])), "x": r["x"]}).to_csv(f_x, index=False)
-        return r["x"], info
-    sdp.m.Params.MIPFocus = 1           # find feasible prices first: the KKT/SOS1 model rarely finds one early
-    sdp.m.Params.NoRelHeurTime = min(120.0, 0.2 * time_limit)   # heuristic search for a first solution
-    import time
-    t0 = time.time()
-    full_start = (x_start is not None and params.get("budget", "expectation") in ("expectation", "chance")
-                  and _complete_start(sdp, com, S_in, np.asarray(x_start, dtype=float), time_limit, verbose))
-    start_s = time.time() - t0
-    has_start = getattr(sdp, "start_solution", None) is not None
-    r = sdp.solve(time_limit=time_limit, x_start=None if (full_start or has_start) else x_start, verbose=verbose)
+    r = StochasticDP(com, S_in).build(**params).solve(time_limit=time_limit, x_start=x_start, verbose=verbose)
+    if not r["has_solution"]:
+        print(f"  {label}: no solution within {time_limit:.0f} s ({r['status']}); skipped")
+        return None, {"model": label, "status": r["status"], "N": r["N"], "runtime_s": r["runtime_s"],
+                      "n_vars": r["n_vars"], "n_sos": r["n_sos"]}
+    if r["max_KKT_residual"] > 1e-4:
+        raise RuntimeError(f"{tag}: KKT validation failed")
     keys = ("status", "N", "runtime_s", "mip_gap", "best_bound", "objective_DKK", "expected_cost_DKK",
             "max_KKT_residual", "n_vars", "n_constrs", "n_sos")
-    if r["has_solution"]:
-        if r["max_KKT_residual"] > 1e-4:
-            raise RuntimeError(f"{tag}: KKT validation failed")
-        info = {"model": label, **{k: r[k] for k in keys}, "start_s": start_s}   # start_s: building the start
-    elif getattr(sdp, "start_solution", None) is not None:
-        # Gurobi found no solution of its own and did not accept the start: keep the start, which is feasible by
-        # construction (budget-balanced prices with the members' optimal responses); its gap to Gurobi's lower
-        # bound says how far it can be from the optimum
-        st, bound = sdp.start_solution, r["best_bound"]
-        cost = st["expected_cost_DKK"]
-        print(f"  no solution from Gurobi in {time_limit:.0f} s: keeping the start prices (expected cost {cost:.2f}, "
-              f"lower bound {bound:.2f}, gap {100 * (cost - bound) / cost:.2f}%)")
-        r = {**r, "x": st["x"], "status": "START", "objective_DKK": cost, "expected_cost_DKK": cost,
-             "mip_gap": (cost - bound) / cost, "max_KKT_residual": np.nan}
-        info = {"model": label, **{k: r.get(k, np.nan) for k in keys}, "start_s": start_s}
-    else:
-        raise RuntimeError(f"{tag}: no solution ({r['status']}) - try a longer --q3-time-limit or a smaller --q3-n")
+    info = {"model": label, **{k: r[k] for k in keys}}
     pd.DataFrame([info]).to_csv(f_info, index=False)
     pd.DataFrame({"hour": range(len(r["x"])), "x": r["x"]}).to_csv(f_x, index=False)
     return r["x"], info
 
-    
+
 def run_q3_validate(com, n: int = 2, seed: int = 1, time_limit: float = 120) -> None:
     """Q3 validation of the variants on a small scenario set: the limit cases beta_r = 0 (CVaR) and eps = 1 (chance
     constraint) must reproduce SDP^b, and the predicted ordering of the in-sample expected costs must hold."""
@@ -663,22 +493,24 @@ def run_q3_validate(com, n: int = 2, seed: int = 1, time_limit: float = 120) -> 
 # ---------------------------------------------------------------------------------------------------------------
 # key -> (label used in tables and figures, build() switches of StochasticDP from the risk parameters)
 Q3_MODELS = {
-    "b":    ("SDP^b",    lambda alpha, beta_r, eps: {}),
-    "cvar": ("SDP^CVaR", lambda alpha, beta_r, eps: {"objective": "cvar", "alpha": alpha, "beta_r": beta_r}),
-    "cc":   ("SDP^CC",   lambda alpha, beta_r, eps: {"budget": "chance", "eps": eps}),
+    "b":    ("SDP^b",    lambda alpha, beta_r, eps, tol: {}),
+    "cvar": ("SDP^CVaR", lambda alpha, beta_r, eps, tol: {"objective": "cvar", "alpha": alpha, "beta_r": beta_r}),
+    "cc":   ("SDP^CC",   lambda alpha, beta_r, eps, tol: {"budget": "chance", "eps": eps, "deficit_tol": tol}),
 }
 Q3_COLORS = {"DP": "#7f7f7f", "SDP^b": "#1f77b4", "SDP^CVaR": "#d62728", "SDP^CC": "#2ca02c"}
 
 
-def _q3_tag(key: str, n: int, seed: int, alpha: float, beta_r: float, eps: float) -> str:
-    """File tag of one solved model: model key, its risk parameter(s), in-sample size and seed."""
-    par = {"b": "", "cvar": f"_a{alpha:g}_br{beta_r:g}", "cc": f"_eps{eps:g}"}[key]
-    return f"SDP_{key}{par}_N{n}_seed{seed}"
+def _q3_tag(key: str, n: int, seed: int, alpha: float, beta_r: float, eps: float, tol: float = 0.0) -> str:
+    """File tag of one solved model (the same names as the saved results of the group): model, risk parameters,
+    in-sample size and seed."""
+    name = {"b": "SDP_b", "cvar": f"SDP_CVaR_a{alpha:g}_b{beta_r:g}", "cc": f"SDP_CC_eps{eps:g}_tol{tol:g}"}[key]
+    return f"{name}_N{n}_seed{seed}"
 
 
 def run_q3_sdp(com, out_dir: Path, models=("b", "cvar", "cc"), n: int = 5, seed: int = 1, n_out: int = 100,
-               seed_out: int = 100, time_limit: float = 600, resolve: bool = False, alpha: float = 0.2,
-               beta_r: float = 0.5, eps: float = 0.2, verbose: bool = False, plain: bool = False) -> pd.DataFrame:
+               seed_out: int = 100, time_limit: float = 300, resolve: bool = False, alpha: float = 0.2,
+               beta_r: float = 0.5, eps: float = 0.2, deficit_tol: float = 0.0,
+               verbose: bool = False) -> pd.DataFrame:
     """Q3 step 4: solve the stochastic models on N in-sample scenarios and compare them with the baseline DP,
     in-sample and on the n_out out-of-sample scenarios (common random numbers: every model on the same scenarios).
 
@@ -717,11 +549,17 @@ def run_q3_sdp(com, out_dir: Path, models=("b", "cvar", "cc"), n: int = 5, seed:
 
     for key in models:
         label, switches = Q3_MODELS[key]
-        tag = _q3_tag(key, n, seed, alpha, beta_r, eps)
-        x, info = _sdp_solve_or_load(com, S_in, label, switches(alpha, beta_r, eps), tag, out_dir,
-                                     x_start=prices["DP"], time_limit=time_limit, resolve=resolve,
-                                     verbose=verbose, plain=plain)
-        prices[label], solve_info[label] = x, info
+        tag = _q3_tag(key, n, seed, alpha, beta_r, eps, deficit_tol)
+        x_start = prices.get("SDP^b", prices["DP"])        # the variants start from the SDP^b prices
+        x, info = _sdp_solve_or_load(com, S_in, label, switches(alpha, beta_r, eps, deficit_tol), tag, out_dir,
+                                     x_start=x_start, time_limit=time_limit, resolve=resolve, verbose=verbose)
+        solve_info[label] = info
+        if x is None:                        # no solution in the time limit: reported, not evaluated
+            continue
+        prices[label] = x
+        diff = np.flatnonzero(np.abs(x - prices["DP"]) > 1e-3)
+        print(f"  {label} vs DP prices: "
+              + (", ".join(f"h{t} {prices['DP'][t]:.2f}->{x[t]:.2f}" for t in diff) or "same"))
 
     # evaluate every price vector on both scenario sets
     rows, all_s, all_m = [], [], []
@@ -737,7 +575,7 @@ def run_q3_sdp(com, out_dir: Path, models=("b", "cvar", "cc"), n: int = 5, seed:
             rows.append({**_q3_summary(per_s, label), "sample": sample})
 
     summary = pd.DataFrame(rows)
-    info = pd.DataFrame(solve_info.values()).reindex(columns=["model", "status", "runtime_s", "start_s", "mip_gap",
+    info = pd.DataFrame(solve_info.values()).reindex(columns=["model", "status", "runtime_s", "mip_gap",
                                                               "objective_DKK", "expected_cost_DKK", "n_vars", "n_sos"])
     info = info.rename(columns={"objective_DKK": "solver_objective_DKK",
                                 "expected_cost_DKK": "solver_expected_cost_DKK"})
@@ -767,8 +605,11 @@ def run_q3_sdp(com, out_dir: Path, models=("b", "cvar", "cc"), n: int = 5, seed:
             "max_exceed_kWh", "P_deficit_%", "worst_deficit_DKK", "mean_worse_off", "optimism_gap_DKK", "VSS_DKK",
             "runtime_s"]
     pd.set_option("display.width", 250)
+    print(f"\nSolve details (N = {n}, seed {seed})")
+    print(pd.DataFrame(solve_info.values()).reindex(columns=["model", "status", "runtime_s", "mip_gap",
+          "expected_cost_DKK", "n_vars", "n_sos"]).round(4).to_string(index=False))
     print(f"\nQ3 step 4: N = {n} in-sample (seed {seed}), {n_out} out-of-sample (seed {seed_out}); "
-          f"alpha = {alpha}, beta_r = {beta_r}, eps = {eps}")
+          f"alpha = {alpha}, beta_r = {beta_r}, eps = {eps}, deficit tolerance = {deficit_tol}")
     for sample, name in (("in", "In-sample (targeted)"), ("out", "Out-of-sample (achieved)")):
         print(f"\n{name}")
         print(summary[summary["sample"] == sample].set_index("model")[cols].round(2).to_string())
@@ -867,11 +708,11 @@ def main() -> None:
     ap.add_argument("--q3-seed", type=int, default=1, help="Q3: seed of the in-sample scenarios (not the out-of-sample seed)")
     ap.add_argument("--q3-n-out", type=int, default=100, help="Q3: number of out-of-sample scenarios")
     ap.add_argument("--q3-seed-out", type=int, default=100, help="Q3: seed of the out-of-sample scenarios (as in the baseline)")
-    ap.add_argument("--q3-time-limit", type=float, default=600, help="Q3: time limit per SDP solve (s)")
+    ap.add_argument("--q3-time-limit", type=float, default=300, help="Q3: time limit per SDP solve (s)")
+    ap.add_argument("--q3-deficit-tol", type=float, default=0.0, help="Q3: deficit tolerated in SDP^CC (DKK/day)")
     ap.add_argument("--q3-resolve", action="store_true", help="Q3: solve the SDP models again instead of loading the saved prices")
     ap.add_argument("--q3-plot", action="store_true", help="Q3: redraw the step-4 figures from the saved CSV files")
     ap.add_argument("--q3-verbose", action="store_true", help="Q3: print the Gurobi log of the SDP solves")
-    ap.add_argument("--q3-plain", action="store_true", help="Q3: solve with Gurobi defaults and the Q2 prices as start (no warm-start heuristics)")
 
 
         
@@ -910,8 +751,8 @@ def main() -> None:
         run_q3_sdp(com, RESULTS_DIR / args.community / args.day / "Q3", models=args.q3_models.split(","),
                    n=args.q3_n, seed=args.q3_seed, n_out=args.q3_n_out, seed_out=args.q3_seed_out,
                    time_limit=args.q3_time_limit, resolve=args.q3_resolve,
-                   alpha=args.q3_alpha, beta_r=args.q3_beta_r, eps=args.q3_eps, verbose=args.q3_verbose,
-                   plain=args.q3_plain)
+                   alpha=args.q3_alpha, beta_r=args.q3_beta_r, eps=args.q3_eps, deficit_tol=args.q3_deficit_tol,
+                   verbose=args.q3_verbose)
     if args.q3_plot:
         plot_q3_sdp(RESULTS_DIR / args.community / args.day / "Q3")
     if args.q3_validate:
