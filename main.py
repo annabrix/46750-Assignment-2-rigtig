@@ -429,8 +429,58 @@ def _q3_summary(per_s: pd.DataFrame, label: str) -> dict:
             "mean_IR_violation_DKK": per_s.total_IR_violation_DKK.mean()}
 
 
+def _best_start(com, S_in, candidates, budget_tol: float | None, penalty: float = 100.0):
+    """The warm-start prices: among the candidate price sets [(name, x)], the one with the lowest in-sample
+    expected cost plus the budget penalty (|E[surplus]| beyond budget_tol, as in the elastic model)."""
+    best = (np.inf, None, None)
+    seen = []
+    for name, x in candidates:
+        if any(np.allclose(x, y) for y in seen):     # the same prices under another name
+            continue
+        seen.append(x)
+        per_s, _ = evaluate_prices(com, x, S_in)
+        cost = float((per_s.probability * per_s.welfare_cost_DKK).sum())
+        e_sur = float((per_s.probability * per_s.surplus_DKK).sum())
+        score = cost + penalty * max(0.0, abs(e_sur) - (budget_tol or 0.0))
+        print(f"    start candidate {name:26s}: in-sample cost {cost:8.3f}, E[surplus] {e_sur:+7.3f}, score {score:8.3f}")
+        if score < best[0]:
+            best = (score, name, x)
+    return best[1], best[2]
+
+
+def _decomposed_start(com, S_in, sdp, x, budget_tol: float | None, day_time_limit: float = 120.0,
+                      verbose: bool = False) -> bool:
+    """MIP start of the built SDP model sdp at the prices x, solved day by day. With the prices fixed the days do
+    not interact (the elastic budget balance only sets the slack), so each day is a small model of the size of DP
+    instead of one model with all N days. The values are copied into sdp by variable name (the names carry the
+    scenario id). Returns False if a day has no solution in day_time_limit."""
+    by_name = {v.VarName: v for v in sdp.m.getVars()}
+    e_sur = 0.0
+    for sc in S_in:
+        day = StochasticDP(com, [sc]).build(objective="expected", budget="none", ir="none")
+        for t in day.T:
+            day.x[t].LB = day.x[t].UB = float(x[t])
+        day.m.Params.OutputFlag = int(verbose)
+        day.m.Params.TimeLimit = day_time_limit
+        day.m.optimize()
+        if not day.m.SolCount:
+            print(f"    day {sc['id']}: no response in {day_time_limit:.0f} s")
+            return False
+        for v in day.m.getVars():
+            w = by_name.get(v.VarName)
+            if w is not None:
+                w.Start = v.X
+        e_sur += sdp.pi[sc["id"]] * day.v["surplus"][sc["id"]].getValue()
+    for t in sdp.T:
+        sdp.x[t].Start = float(x[t])
+    if sdp.v.get("budget_slack") is not None:
+        sdp.v["budget_slack"].Start = max(0.0, abs(e_sur) - (budget_tol or 0.0))
+    return True
+
+
 def _sdp_solve_or_load(com, S_in, label: str, params: dict, tag: str, out_dir: Path, x_start,
-                       time_limit: float, resolve: bool, verbose: bool = False):
+                       time_limit: float, resolve: bool, verbose: bool = False, start_time_limit: float = 120.0,
+                       candidates=None):
     """Solve one SDP variant on the in-sample scenarios and save its prices and solve details, or reload them.
 
     StochasticDP.solve first solves the model with the prices fixed to x_start and uses that as the MIP start.
@@ -441,10 +491,27 @@ def _sdp_solve_or_load(com, S_in, label: str, params: dict, tag: str, out_dir: P
     if f_x.exists() and f_info.exists() and not resolve:
         print(f"Loaded the {label} prices from {f_x.name} (add --q3-resolve to solve again)")
         return pd.read_csv(f_x).x.to_numpy(), {**pd.read_csv(f_info).iloc[0].to_dict(), "model": label}
-    if f_x.exists():                         # resolving: start from this model's previous solution
-        x_start = pd.read_csv(f_x).x.to_numpy()
-    print(f"Solving {label} ({tag}, time limit {time_limit:.0f} s) ...")
-    r = StochasticDP(com, S_in).build(**params).solve(time_limit=time_limit, x_start=x_start, verbose=verbose)
+    if candidates is not None:               # step 5: best of several price sets, warm start solved day by day
+        if f_x.exists():
+            candidates = [("previous solution", pd.read_csv(f_x).x.to_numpy())] + list(candidates)
+        print(f"Solving {label} ({tag}, time limit {time_limit:.0f} s) ...")
+        import time
+        t0 = time.time()
+        name, x0 = _best_start(com, S_in, candidates, params.get("budget_tol"))
+        sdp = StochasticDP(com, S_in).build(**params)
+        ok = _decomposed_start(com, S_in, sdp, x0, params.get("budget_tol"), verbose=verbose)
+        t_start = time.time() - t0
+        print(f"  warm start ({name}, day by day, {t_start:.0f} s): {'found' if ok else 'NOT found'}")
+        r = sdp.solve(time_limit=time_limit, verbose=verbose)
+        r["runtime_s"] += t_start
+    else:
+        if f_x.exists():                     # resolving: start from this model's previous solution
+            x_start = pd.read_csv(f_x).x.to_numpy()
+        print(f"Solving {label} ({tag}, time limit {time_limit:.0f} s) ...")
+        r = StochasticDP(com, S_in).build(**params).solve(time_limit=time_limit, x_start=x_start, verbose=verbose,
+                                                          start_time_limit=start_time_limit)
+        if x_start is not None:
+            print(f"  warm start from the given prices: {'found' if r['start_found'] else 'NOT found'}")
     if not r["has_solution"]:
         print(f"  {label}: no solution within {time_limit:.0f} s ({r['status']}); skipped")
         return None, {"model": label, "status": r["status"], "N": r["N"], "runtime_s": r["runtime_s"],
@@ -453,7 +520,8 @@ def _sdp_solve_or_load(com, S_in, label: str, params: dict, tag: str, out_dir: P
         raise RuntimeError(f"{tag}: KKT validation failed")
     keys = ("status", "N", "runtime_s", "mip_gap", "best_bound", "objective_DKK", "expected_cost_DKK",
             "max_KKT_residual", "n_vars", "n_constrs", "n_sos")
-    info = {"model": label, **{k: r[k] for k in keys}}
+    info = {"model": label, **{k: r[k] for k in keys},
+            **{k: r[k] for k in ("budget_tol", "budget_slack_DKK", "expected_surplus_DKK") if k in r}}
     pd.DataFrame([info]).to_csv(f_info, index=False)
     pd.DataFrame({"hour": range(len(r["x"])), "x": r["x"]}).to_csv(f_x, index=False)
     return r["x"], info
@@ -684,6 +752,152 @@ def plot_q3_sdp(out_dir: Path) -> None:
     print(f"Figures written to {out_dir}: q3_oos_distribution.png/.pdf, q3_prices.png/.pdf")
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# Question 3, step 5: number of in-sample scenarios N (nested sets, the same out-of-sample set, solve times)
+# ---------------------------------------------------------------------------------------------------------------
+def run_q3_n_study(com, out_dir: Path, ns=(2, 3, 5, 10), seed: int = 1, n_out: int = 100, seed_out: int = 100,
+                   time_limit: float = 1800, resolve: bool = False, budget_tol: float | None = 0.5,
+                   resolve_ns=(), verbose: bool = False) -> pd.DataFrame:
+    """Q3 step 5: SDP^b solved on N = ns in-sample scenarios and evaluated on the same n_out out-of-sample scenarios.
+
+    The in-sample sets are nested: draw_scenarios gives every member its own random stream, so with the same seed
+    the first N scenarios of a larger set are the N scenarios of the smaller one (checked below). Each N is solved
+    once and saved as SDP_b_N<N>_seed<seed> (the N of step 4 is reused); the solve of a larger N starts from the
+    prices of the next smaller N. Reports per N: expected cost in-sample (solver) and out-of-sample, optimism gap,
+    VSS against DP, cap and deficit frequency out-of-sample, solve time, MIP gap and model size.
+    Writes q3_nstudy_summary.csv, q3_nstudy_scenarios.csv and the figure q3_nstudy (.png/.pdf).
+    budget_tol: elastic expected budget balance, |E[surplus]| <= budget_tol free and a penalty beyond it, so that
+    every warm start is feasible (None: exact balance as in step 4). Saved as SDP_b_btol<tol>_N<N>_seed<seed>;
+    when the exact-balance prices of the same N exist (e.g. step 4), the solve starts from them.
+    """
+    if seed == seed_out:
+        raise ValueError("the in-sample seed must differ from the out-of-sample seed (else the sets overlap)")
+    ns = sorted(set(int(n) for n in ns))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    R = {d.consumer_id: FlexibleConsumerModel(d).build().solve().objective for d in com.members}
+    dp = solve_dp(build_dp(com, "bb", R), time_limit=120)
+    x_dp = dp["hourly"].x.to_numpy()
+    S_out = draw_scenarios(com, n=n_out, seed=seed_out)
+
+    print(f"Evaluating DP on the {n_out} out-of-sample scenarios ...")
+    dp_out, _ = evaluate_prices(com, x_dp, S_out)
+    dp_mean = dp_out.welfare_cost_DKK.mean()
+    dp_out.insert(0, "N", 1)
+    dp_out.insert(1, "model", "DP")
+    all_s = [dp_out]
+    rows = [{"N": 1, "model": "DP", "status": dp["status"], "in_sample_cost_DKK": dp["objective_DKK"],
+             **{k: v for k, v in _q3_summary(dp_out, "DP").items() if k != "model"},
+             "runtime_s": dp["runtime_s"], "mip_gap": dp["mip_gap"], "n_vars": dp["n_vars"], "n_sos": dp["n_sos"]}]
+
+    sets, x_prev = {}, x_dp
+    solved = [("DP", x_dp)]                  # price sets of this study: warm-start candidates of the next N
+    for n in ns:
+        S_in = draw_scenarios(com, n=n, seed=seed)
+        sets[n] = S_in
+        for m in ns:                         # nested: the first m scenarios equal the smaller set of size m
+            if m < n and m in sets:
+                same = all(np.allclose(list(a["theta"]["profile"].values()), list(b["theta"]["profile"].values()))
+                           for a, b in zip(sets[m], S_in[:m]))
+                if not same:
+                    raise RuntimeError(f"scenario sets N={m} and N={n} are not nested")
+        tag = _q3_tag("b", n, seed, 0.2, 0.5, 0.2)
+        params, x_start = {}, x_prev
+        if budget_tol is not None:
+            f_exact = out_dir / f"{tag}_prices.csv"
+            if f_exact.exists():             # the exact-balance prices of this N are feasible here: best start
+                x_start = pd.read_csv(f_exact).x.to_numpy()
+            tag = tag.replace("SDP_b_", f"SDP_b_btol{budget_tol:g}_")
+            params = {"budget_tol": budget_tol}
+        cands = None
+        if budget_tol is not None:           # elastic budget: any prices are a feasible start, so take the best
+            cands = ([("exact balance, same N", x_start)] if x_start is not x_prev else []) + solved[::-1]
+            for f in sorted(out_dir.glob(f"SDP_b_btol{budget_tol:g}_N*_seed{seed}_prices.csv")):
+                if f.name != f"{tag}_prices.csv":    # saved solutions of other N (e.g. a larger N of an earlier run)
+                    cands.append((f.name.replace("_prices.csv", ""), pd.read_csv(f).x.to_numpy()))
+        x, info = _sdp_solve_or_load(com, S_in, "SDP^b", params, tag, out_dir, x_start=x_start,
+                                     time_limit=time_limit, resolve=resolve or n in set(resolve_ns),
+                                     verbose=verbose, start_time_limit=600.0, candidates=cands)
+        row = {"N": n, "model": "SDP^b", "status": info.get("status"), "runtime_s": info.get("runtime_s"),
+               "mip_gap": info.get("mip_gap"), "n_vars": info.get("n_vars"), "n_sos": info.get("n_sos"),
+               "budget_slack_DKK": info.get("budget_slack_DKK"), "in_sample_E_surplus_DKK": info.get("expected_surplus_DKK")}
+        if x is None:                        # no solution in the time limit: reported, not evaluated
+            rows.append(row)
+            continue
+        x_prev = x
+        solved.append((f"SDP^b N={n}", x))
+        print(f"Evaluating SDP^b (N = {n}) on the {n} in-sample and {n_out} out-of-sample scenarios ...")
+        per_in, _ = evaluate_prices(com, x, S_in)
+        per_out, _ = evaluate_prices(com, x, S_out)
+        per_out.insert(0, "N", n)
+        per_out.insert(1, "model", "SDP^b")
+        all_s.append(per_out)
+        summ = {k: v for k, v in _q3_summary(per_out, "SDP^b").items() if k != "model"}
+        row.update({"in_sample_cost_DKK": per_in.welfare_cost_DKK.mean(), **summ})
+        row["in_sample_deficit_%"] = 100 * (per_in.surplus_DKK < -1e-4).mean()
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    df["optimism_gap_DKK"] = df["mean_cost_DKK"] - df["in_sample_cost_DKK"]
+    df["VSS_DKK"] = dp_mean - df["mean_cost_DKK"]
+    df.to_csv(out_dir / "q3_nstudy_summary.csv", index=False)
+    pd.concat(all_s).to_csv(out_dir / "q3_nstudy_scenarios.csv", index=False)
+
+    cols = ["model", "status", "in_sample_cost_DKK", "mean_cost_DKK", "optimism_gap_DKK", "VSS_DKK",
+            "CVaR90_cost_DKK", "P_exceed_%", "P_deficit_%", "mean_surplus_DKK", "budget_slack_DKK", "runtime_s", "mip_gap", "n_vars"]
+    pd.set_option("display.width", 250)
+    print(f"\nQ3 step 5: SDP^b for N = {ns} (nested, seed {seed}); out-of-sample: {n_out} scenarios (seed {seed_out})")
+    print(df.set_index("N")[cols].round(3).to_string())
+    plot_q3_n_study(out_dir)
+    return df
+
+
+def plot_q3_n_study(out_dir: Path) -> None:
+    """Figure of Q3 step 5 from q3_nstudy_summary.csv (no solving): (a) expected cost in-sample and out-of-sample
+    against N, with DP out-of-sample as a reference; (b) optimism gap and out-of-sample deficit frequency;
+    (c) solution time (log scale) and model size."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    df = pd.read_csv(out_dir / "q3_nstudy_summary.csv")
+    dp = df[df.model == "DP"].iloc[0]
+    s = df[(df.model == "SDP^b") & df.mean_cost_DKK.notna()].sort_values("N")
+    fig, (a1, a2, a3) = plt.subplots(1, 3, figsize=(12, 3.6))
+
+    a1.plot(s.N, s.mean_cost_DKK, "o-", color=Q3_COLORS["SDP^b"], label="out-of-sample (100 days)")
+    a1.plot(s.N, s.in_sample_cost_DKK, "s--", color=Q3_COLORS["SDP^b"], alpha=0.6, label="in-sample (training days)")
+    a1.axhline(dp.mean_cost_DKK, ls=":", color=Q3_COLORS["DP"], label=f"$\\mathcal{{DP}}$ out-of-sample ({dp.mean_cost_DKK:.1f})")
+    a1.set_xlabel("in-sample scenarios $N$")
+    a1.set_ylabel("expected community cost (DKK/day)")
+    a1.legend(fontsize=7)
+
+    a2.plot(s.N, s.optimism_gap_DKK, "o-", color="black", label="optimism gap (DKK/day)")
+    a2.set_xlabel("in-sample scenarios $N$")
+    a2.set_ylabel("optimism gap (DKK/day)")
+    b2 = a2.twinx()
+    b2.plot(s.N, s["P_deficit_%"], "^-", color="#d62728", label="deficit days, out-of-sample (%)")
+    b2.set_ylabel("deficit days out-of-sample (%)", color="#d62728")
+    h1, l1 = a2.get_legend_handles_labels()
+    h2, l2 = b2.get_legend_handles_labels()
+    a2.legend(h1 + h2, l1 + l2, fontsize=7)
+
+    t = df[df.model == "SDP^b"].sort_values("N")
+    a3.semilogy(t.N, t.runtime_s, "o-", color="black")
+    for _, r in t.iterrows():
+        note = f"{int(r.n_vars / 1000)}k vars" + ("" if r.status == "OPTIMAL" else f"\n{r.status}")
+        a3.annotate(note, (r.N, r.runtime_s), textcoords="offset points", xytext=(4, 4), fontsize=7)
+    a3.set_xlabel("in-sample scenarios $N$")
+    a3.set_ylabel("solution time (s, log scale)")
+    for ax in (a1, a2, a3):
+        ax.grid(alpha=0.3)
+        ax.set_xticks(sorted(df[df.model == "SDP^b"].N.unique()))
+    fig.tight_layout()
+    for ext in ("png", "pdf"):
+        fig.savefig(out_dir / f"q3_nstudy.{ext}", dpi=200)
+    plt.close(fig)
+    print(f"Figure written to {out_dir}: q3_nstudy.png/.pdf")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--community", default="base", help=f"base (shipped) or your own params_community_<name>.json; available: {list_communities()}")
@@ -713,6 +927,11 @@ def main() -> None:
     ap.add_argument("--q3-resolve", action="store_true", help="Q3: solve the SDP models again instead of loading the saved prices")
     ap.add_argument("--q3-plot", action="store_true", help="Q3: redraw the step-4 figures from the saved CSV files")
     ap.add_argument("--q3-verbose", action="store_true", help="Q3: print the Gurobi log of the SDP solves")
+    ap.add_argument("--q3-nstudy", action="store_true", help="Q3 step 5: SDP^b for several N (nested) on the same 100 test days")
+    ap.add_argument("--q3-ns", default="2,3,5,10", help="Q3 step 5: values of N, comma-separated")
+    ap.add_argument("--q3-resolve-ns", default="", help="Q3 step 5: values of N to solve again, comma-separated")
+    ap.add_argument("--q3-budget-tol", type=float, default=0.5,
+                    help="Q3 step 5: free band of the expected budget balance (DKK/day), penalty beyond; negative = exact")
 
 
         
@@ -755,6 +974,12 @@ def main() -> None:
                    verbose=args.q3_verbose)
     if args.q3_plot:
         plot_q3_sdp(RESULTS_DIR / args.community / args.day / "Q3")
+    if args.q3_nstudy:
+        run_q3_n_study(com, RESULTS_DIR / args.community / args.day / "Q3", ns=[int(v) for v in args.q3_ns.split(",")],
+                       seed=args.q3_seed, n_out=args.q3_n_out, seed_out=args.q3_seed_out,
+                       time_limit=args.q3_time_limit, resolve=args.q3_resolve,
+                       budget_tol=None if args.q3_budget_tol < 0 else args.q3_budget_tol,
+                       resolve_ns=[int(v) for v in args.q3_resolve_ns.split(",") if v.strip()], verbose=args.q3_verbose)
     if args.q3_validate:
         run_q3_validate(com)
 
