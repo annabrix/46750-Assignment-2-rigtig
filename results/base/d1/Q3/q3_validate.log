@@ -1,0 +1,31 @@
+Community            : base (EC_base), day d1 - Monday (Assignment 1 day)
+Members              : 16  (L1 x1, L1+BAT x1, L1+PV x1, L1+PV+BAT x1, L2 x1, L2+BAT x1, L2+PV x1, L2+PV+BAT x1, L3 x1, L3+BAT x1, L3+PV x1, L3+PV+BAT x1, L4 x1, L4+BAT x1, L4+PV x1, L4+PV+BAT x1)
+Slope classes        : L1 x4, L2 x4, L3 x4, L4 x4
+Connected load / PV  : 48 kW / 24 kW (8 systems); batteries 8
+Energy price         : mean 1.32, min 0.85, max 2.50 DKK/kWh
+Tariffs imp/exp      : 0.50 / 0.40 DKK/kWh, discount beta = 0.75
+Cap                  : 9.39 - 9.39 kW (daily energy 225.4 kWh = 1.3 x import without contract), penalty 10.0 DKK/kWh
+Individual caps (I)  : shares (energy_net) C1 0.104, C1_PV 0.020, C1_B 0.106, C1_PVB 0.020, ... 
+
+Cap profile (kW): 9.4 9.4 9.4 9.4 9.4 9.4 9.4 9.4 9.4 9.4 9.4 9.4 9.4 9.4 9.4 9.4 9.4 9.4 9.4 9.4 9.4 9.4 9.4 9.4
+Individual caps in model I (kW), hour 0 / hour 11: C1 (L1) 0.98/0.98  C1_PVB (L1+PV+BAT) 0.19/0.19  C4 (L4) 0.98/0.98  C4_PVB (L4+PV+BAT) 0.19/0.19
+Set parameter Username
+Set parameter LicenseID to value 2861719
+Academic license - for non-commercial use only - expires 2027-09-09
+SDP^b                  TIME_LIMIT
+SDP^CVaR beta_r=0      TIME_LIMIT
+SDP^CC eps=1           TIME_LIMIT
+SDP^CVaR beta_r=0.5    OPTIMAL
+SDP^CC eps=0           TIME_LIMIT
+
+Validation of the variants (N = 2, seed 1)
+                         status   gap_%  expected_cost_DKK  worst_scenario_DKK  max_KKT_residual  runtime_s
+model                                                                                                      
+SDP^b                TIME_LIMIT  0.0125           371.6575            375.2331               0.0   120.0078
+SDP^CVaR beta_r=0    TIME_LIMIT  0.0125           371.6575            375.2331               0.0   120.0058
+SDP^CC eps=1         TIME_LIMIT  0.0125           371.6575            375.2331               0.0   120.0074
+SDP^CVaR beta_r=0.5     OPTIMAL  0.0063           371.6575            375.2331               0.0    29.9740
+SDP^CC eps=0         TIME_LIMIT  0.2828           372.6649            376.2866               0.0   120.0097
+
+Limit cases reproduce SDP^b: True
+Predicted ordering (variants >= SDP^b in expected cost): True
