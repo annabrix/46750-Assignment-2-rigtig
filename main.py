@@ -1139,9 +1139,9 @@ def main() -> None:
     if args.settlement:
         run_settlement(com, RESULTS_DIR / args.community / args.day)
     if args.q2_sensitivity:
-        run_q2_sensitivity(com, RESULTS_DIR / args.community / args.day / "Q2")
+        run_q2_sensitivity(com, RESULTS_DIR / args.community / args.day / "Q2_dp")
     if args.q2:
-        run_q2(com, RESULTS_DIR / args.community / args.day / "Q2")
+        run_q2(com, RESULTS_DIR / args.community / args.day / "Q2_dp")
     if args.q3_baseline:
         run_q3_baseline(com, RESULTS_DIR / args.community / args.day / "Q3")
     if args.q3_sdp:
