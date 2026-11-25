@@ -429,7 +429,8 @@ def _q3_summary(per_s: pd.DataFrame, label: str) -> dict:
             "mean_IR_violation_DKK": per_s.total_IR_violation_DKK.mean()}
 
 
-def _best_start(com, S_in, candidates, budget_tol: float | None, penalty: float = 100.0):
+def _best_start(com, S_in, candidates, budget_tol: float | None, penalty: float = 100.0,
+                deficit_tol: float | None = None):
     """The warm-start prices: among the candidate price sets [(name, x)], the one with the lowest in-sample
     expected cost plus the budget penalty (|E[surplus]| beyond budget_tol, as in the elastic model)."""
     best = (np.inf, None, None)
@@ -442,6 +443,8 @@ def _best_start(com, S_in, candidates, budget_tol: float | None, penalty: float 
         cost = float((per_s.probability * per_s.welfare_cost_DKK).sum())
         e_sur = float((per_s.probability * per_s.surplus_DKK).sum())
         score = cost + penalty * max(0.0, abs(e_sur) - (budget_tol or 0.0))
+        if deficit_tol is not None:          # SDP^CC (eps = 0): every deficit beyond deficit_tol is penalised
+            score += penalty * float((per_s.probability * (-per_s.surplus_DKK - deficit_tol).clip(lower=0)).sum())
         print(f"    start candidate {name:26s}: in-sample cost {cost:8.3f}, E[surplus] {e_sur:+7.3f}, score {score:8.3f}")
         if score < best[0]:
             best = (score, name, x)
@@ -455,7 +458,7 @@ def _decomposed_start(com, S_in, sdp, x, budget_tol: float | None, day_time_limi
     instead of one model with all N days. The values are copied into sdp by variable name (the names carry the
     scenario id). Returns False if a day has no solution in day_time_limit."""
     by_name = {v.VarName: v for v in sdp.m.getVars()}
-    e_sur = 0.0
+    e_sur, dtol = 0.0, sdp.settings.get("deficit_tol", 0.0)
     for sc in S_in:
         day = StochasticDP(com, [sc]).build(objective="expected", budget="none", ir="none")
         for t in day.T:
@@ -470,7 +473,12 @@ def _decomposed_start(com, S_in, sdp, x, budget_tol: float | None, day_time_limi
             w = by_name.get(v.VarName)
             if w is not None:
                 w.Start = v.X
-        e_sur += sdp.pi[sc["id"]] * day.v["surplus"][sc["id"]].getValue()
+        sur = day.v["surplus"][sc["id"]].getValue()
+        e_sur += sdp.pi[sc["id"]] * sur
+        if sdp.v.get("v_def"):               # SDP^CC: no deficit allowed by the binary, the rest in the slack
+            sdp.v["v_def"][sc["id"]].Start = 0.0
+            if sdp.v.get("deficit_slack"):
+                sdp.v["deficit_slack"][sc["id"]].Start = max(0.0, -sur - dtol)
     for t in sdp.T:
         sdp.x[t].Start = float(x[t])
     if sdp.v.get("budget_slack") is not None:
@@ -497,7 +505,8 @@ def _sdp_solve_or_load(com, S_in, label: str, params: dict, tag: str, out_dir: P
         print(f"Solving {label} ({tag}, time limit {time_limit:.0f} s) ...")
         import time
         t0 = time.time()
-        name, x0 = _best_start(com, S_in, candidates, params.get("budget_tol"))
+        name, x0 = _best_start(com, S_in, candidates, params.get("budget_tol"),
+                               deficit_tol=params.get("deficit_tol") if params.get("budget") == "chance" else None)
         sdp = StochasticDP(com, S_in).build(**params)
         ok = _decomposed_start(com, S_in, sdp, x0, params.get("budget_tol"), verbose=verbose)
         t_start = time.time() - t0
@@ -521,7 +530,8 @@ def _sdp_solve_or_load(com, S_in, label: str, params: dict, tag: str, out_dir: P
     keys = ("status", "N", "runtime_s", "mip_gap", "best_bound", "objective_DKK", "expected_cost_DKK",
             "max_KKT_residual", "n_vars", "n_constrs", "n_sos")
     info = {"model": label, **{k: r[k] for k in keys},
-            **{k: r[k] for k in ("budget_tol", "budget_slack_DKK", "expected_surplus_DKK") if k in r}}
+            **{k: r[k] for k in ("budget_tol", "budget_slack_DKK", "expected_surplus_DKK", "max_deficit_slack_DKK")
+               if k in r}}
     pd.DataFrame([info]).to_csv(f_info, index=False)
     pd.DataFrame({"hour": range(len(r["x"])), "x": r["x"]}).to_csv(f_x, index=False)
     return r["x"], info
@@ -577,7 +587,7 @@ def _q3_tag(key: str, n: int, seed: int, alpha: float, beta_r: float, eps: float
 
 def run_q3_sdp(com, out_dir: Path, models=("b", "cvar", "cc"), n: int = 5, seed: int = 1, n_out: int = 100,
                seed_out: int = 100, time_limit: float = 300, resolve: bool = False, alpha: float = 0.2,
-               beta_r: float = 0.5, eps: float = 0.2, deficit_tol: float = 0.0,
+               beta_r: float = 0.5, eps: float = 0.2, deficit_tol: float = 0.0, cc_budget_tol: float | None = None,
                verbose: bool = False) -> pd.DataFrame:
     """Q3 step 4: solve the stochastic models on N in-sample scenarios and compare them with the baseline DP,
     in-sample and on the n_out out-of-sample scenarios (common random numbers: every model on the same scenarios).
@@ -619,8 +629,21 @@ def run_q3_sdp(com, out_dir: Path, models=("b", "cvar", "cc"), n: int = 5, seed:
         label, switches = Q3_MODELS[key]
         tag = _q3_tag(key, n, seed, alpha, beta_r, eps, deficit_tol)
         x_start = prices.get("SDP^b", prices["DP"])        # the variants start from the SDP^b prices
-        x, info = _sdp_solve_or_load(com, S_in, label, switches(alpha, beta_r, eps, deficit_tol), tag, out_dir,
-                                     x_start=x_start, time_limit=time_limit, resolve=resolve, verbose=verbose)
+        params, cands = switches(alpha, beta_r, eps, deficit_tol), None
+        if key == "cc" and cc_budget_tol is not None:
+            # elastic SDP^CC (as in step 5): |E[surplus]| <= cc_budget_tol free, every deficit beyond deficit_tol
+            # and every budget miss beyond the band penalised, warm start of the best known prices day by day
+            params = {**params, "budget_tol": cc_budget_tol}
+            tag = tag.replace(f"_N{n}_", f"_btol{cc_budget_tol:g}_N{n}_")
+            f_b = out_dir / f"{_q3_tag('b', n, seed, alpha, beta_r, eps)}_prices.csv"
+            cands = [("SDP^b", prices["SDP^b"])] if "SDP^b" in prices else \
+                    ([("SDP^b (saved)", pd.read_csv(f_b).x.to_numpy())] if f_b.exists() else [])
+            cands.append(("DP", prices["DP"]))
+        x, info = _sdp_solve_or_load(com, S_in, label, params, tag, out_dir, x_start=x_start,
+                                     time_limit=time_limit, resolve=resolve, verbose=verbose, candidates=cands)
+        if "max_deficit_slack_DKK" in info:
+            print(f"  {label}: largest deficit beyond the tolerance {info['max_deficit_slack_DKK']:.3f} DKK, "
+                  f"E[surplus] {info['expected_surplus_DKK']:+.3f} DKK (budget slack {info['budget_slack_DKK']:.3f})")
         solve_info[label] = info
         if x is None:                        # no solution in the time limit: reported, not evaluated
             continue
@@ -898,6 +921,156 @@ def plot_q3_n_study(out_dir: Path) -> None:
     print(f"Figure written to {out_dir}: q3_nstudy.png/.pdf")
 
 
+def run_q3_risk_study(com, out_dir: Path, n: int = 5, seed: int = 1, n_out: int = 100, seed_out: int = 100,
+                      epss=(0.0, 0.2, 0.4), betas=(0.0, 0.25, 0.5, 0.75, 1.0), alpha: float = 0.2,
+                      deficit_tol: float = 1.0, cc_budget_tol: float | None = 0.5, time_limit: float = 1800,
+                      resolve: bool = False, verbose: bool = False) -> pd.DataFrame:
+    """Q3 step 6: sensitivity of the stochastic variations to the parameter that tunes them, on the same N in-sample
+    and n_out out-of-sample scenarios as step 4.
+
+    SDP^CC: eps = the share of training days allowed a deficit beyond deficit_tol (a multiple of 1/N). With
+    cc_budget_tol the expected budget balance and the no-deficit rule are elastic (penalised beyond the tolerance),
+    as in step 5, so every warm start is feasible. SDP^CVaR: beta_r = weight of CVaR_alpha in the objective;
+    beta_r = 0 is SDP^b. Every solved price vector is evaluated in- and out-of-sample (identical price vectors only
+    once). Writes q3_risk_summary.csv and the figure q3_risk (.png/.pdf).
+    """
+    if seed == seed_out:
+        raise ValueError("the in-sample seed must differ from the out-of-sample seed (else the sets overlap)")
+    for e in epss:
+        if abs(e * n - round(e * n)) > 1e-9:
+            raise ValueError(f"eps = {e} is not a multiple of 1/N = {1 / n:.3f}")
+    if abs(alpha * n - round(alpha * n)) > 1e-9:
+        raise ValueError(f"alpha = {alpha} is not a multiple of 1/N = {1 / n:.3f}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    R = {d.consumer_id: FlexibleConsumerModel(d).build().solve().objective for d in com.members}
+    dp = solve_dp(build_dp(com, "bb", R), time_limit=120)
+    x_dp = dp["hourly"].x.to_numpy()
+    S_in = draw_scenarios(com, n=n, seed=seed)
+    S_out = draw_scenarios(com, n=n_out, seed=seed_out)
+
+    cache = {}
+
+    def evaluate(label, x):
+        key = tuple(np.round(x, 6))
+        if key not in cache:
+            print(f"Evaluating {label} on the {n} in-sample and {n_out} out-of-sample scenarios ...")
+            cache[key] = (evaluate_prices(com, x, S_in)[0], evaluate_prices(com, x, S_out)[0], label)
+        elif cache[key][2] != label:
+            print(f"  {label}: same prices as {cache[key][2]} (evaluation reused)")
+        return cache[key]
+
+    def row(study, param, label, x, info):
+        per_in, per_out, same = evaluate(label, x)
+        s_in, s_out = _q3_summary(per_in, label), _q3_summary(per_out, label)
+        return {"study": study, "param": param, "model": label, "status": info.get("status"),
+                "same_prices_as": same if same != label else "",
+                "in_cost_DKK": s_in["mean_cost_DKK"], "out_cost_DKK": s_out["mean_cost_DKK"],
+                "in_CVaR_DKK": _cvar(per_in.welfare_cost_DKK, alpha), "out_CVaR90_DKK": s_out["CVaR90_cost_DKK"],
+                "out_worst_DKK": s_out["worst_cost_DKK"],
+                "in_deficit_%": s_in["P_deficit_%"], "out_deficit_%": s_out["P_deficit_%"],
+                "in_worst_deficit_DKK": s_in["worst_deficit_DKK"], "out_worst_deficit_DKK": s_out["worst_deficit_DKK"],
+                "out_mean_surplus_DKK": s_out["mean_surplus_DKK"],
+                "in_exceed_%": s_in["P_exceed_%"], "out_exceed_%": s_out["P_exceed_%"],
+                "out_penalty_DKK": s_out["mean_penalty_DKK"],
+                "runtime_s": info.get("runtime_s"), "mip_gap": info.get("mip_gap"),
+                "max_deficit_slack_DKK": info.get("max_deficit_slack_DKK"), "budget_slack_DKK": info.get("budget_slack_DKK")}
+
+    rows = [row("ref", np.nan, "DP", x_dp, {"status": dp["status"], "runtime_s": dp["runtime_s"], "mip_gap": dp["mip_gap"]})]
+    x_b, info_b = _sdp_solve_or_load(com, S_in, "SDP^b", {}, _q3_tag("b", n, seed, alpha, 0.5, 0.2), out_dir,
+                                     x_start=x_dp, time_limit=time_limit, resolve=False, verbose=verbose)
+    if x_b is None:
+        raise RuntimeError("SDP^b has no solution: run step 4 first")
+    rows.append(row("ref", np.nan, "SDP^b", x_b, info_b))
+
+    # SDP^CC: eps sweep
+    solved = [("SDP^b", x_b), ("DP", x_dp)]
+    for e in sorted(epss):
+        label = f"SDP^CC eps={e:g}"
+        params = {"budget": "chance", "eps": e, "deficit_tol": deficit_tol}
+        tag = _q3_tag("cc", n, seed, alpha, 0.5, e, deficit_tol)
+        cands = None
+        if cc_budget_tol is not None:
+            params["budget_tol"] = cc_budget_tol
+            tag = tag.replace(f"_N{n}_", f"_btol{cc_budget_tol:g}_N{n}_")
+            cands = solved[::-1]
+        x, info = _sdp_solve_or_load(com, S_in, label, params, tag, out_dir, x_start=x_b, time_limit=time_limit,
+                                     resolve=resolve, verbose=verbose, candidates=cands)
+        if x is None:
+            rows.append({"study": "CC", "param": e, "model": label, "status": info.get("status"),
+                         "runtime_s": info.get("runtime_s")})
+            continue
+        solved.append((label, x))
+        rows.append(row("CC", e, label, x, info))
+
+    # SDP^CVaR: beta_r sweep (beta_r = 0 is SDP^b)
+    for b in sorted(betas):
+        label = f"SDP^CVaR beta={b:g}"
+        if b == 0:
+            rows.append({**row("CVaR", 0.0, "SDP^b", x_b, info_b), "model": label})
+            continue
+        x, info = _sdp_solve_or_load(com, S_in, label, {"objective": "cvar", "alpha": alpha, "beta_r": b},
+                                     _q3_tag("cvar", n, seed, alpha, b, 0.2), out_dir, x_start=x_b,
+                                     time_limit=time_limit, resolve=resolve, verbose=verbose)
+        if x is None:
+            rows.append({"study": "CVaR", "param": b, "model": label, "status": info.get("status"),
+                         "runtime_s": info.get("runtime_s")})
+            continue
+        rows.append(row("CVaR", b, label, x, info))
+
+    df = pd.DataFrame(rows)
+    dp_out = df.loc[df.model == "DP", "out_cost_DKK"].iloc[0]
+    df["VSS_DKK"] = dp_out - df["out_cost_DKK"]
+    df["optimism_gap_DKK"] = df["out_cost_DKK"] - df["in_cost_DKK"]
+    df.to_csv(out_dir / "q3_risk_summary.csv", index=False)
+    cols = ["model", "status", "same_prices_as", "in_cost_DKK", "out_cost_DKK", "VSS_DKK", "in_CVaR_DKK",
+            "out_CVaR90_DKK", "in_deficit_%", "out_deficit_%", "out_worst_deficit_DKK", "out_exceed_%",
+            "max_deficit_slack_DKK", "runtime_s", "mip_gap"]
+    pd.set_option("display.width", 260)
+    print(f"\nQ3 step 6: N = {n} (seed {seed}), out-of-sample {n_out} (seed {seed_out}); alpha = {alpha}, "
+          f"deficit tolerance = {deficit_tol} DKK, budget band = {cc_budget_tol} DKK")
+    print(df[cols].round(3).to_string(index=False))
+    plot_q3_risk(out_dir)
+    return df
+
+
+def plot_q3_risk(out_dir: Path) -> None:
+    """Figure of Q3 step 6 from q3_risk_summary.csv: per study (columns: SDP^CC against eps, SDP^CVaR against beta_r)
+    the expected cost and CVaR in- and out-of-sample (top) and the deficit and cap frequencies (bottom)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    df = pd.read_csv(out_dir / "q3_risk_summary.csv")
+    dp = df[df.model == "DP"].iloc[0]
+    fig, axes = plt.subplots(2, 2, figsize=(10, 6.4), sharex="col")
+    for j, (study, xlab, col) in enumerate((("CC", r"$\varepsilon$ (share of training days with a deficit allowed)",
+                                             Q3_COLORS["SDP^CC"]),
+                                            ("CVaR", r"$\beta^{r}$ (weight of CVaR in the objective)",
+                                             Q3_COLORS["SDP^CVaR"]))):
+        s = df[(df.study == study) & df.out_cost_DKK.notna()].sort_values("param")
+        a, b = axes[0, j], axes[1, j]
+        a.plot(s.param, s.out_cost_DKK, "o-", color=col, label="mean cost, out-of-sample")
+        a.plot(s.param, s.in_cost_DKK, "s--", color=col, alpha=0.6, label="mean cost, in-sample")
+        a.plot(s.param, s.out_CVaR90_DKK, "^:", color="black", label=r"CVaR$_{90}$, out-of-sample")
+        a.axhline(dp.out_cost_DKK, ls=":", color=Q3_COLORS["DP"], label=f"$\\mathcal{{DP}}$ mean, out-of-sample")
+        a.set_ylabel("community cost (DKK/day)")
+        a.set_title(r"$\mathcal{SDP}^{CC}$" if study == "CC" else r"$\mathcal{SDP}^{CVaR}$", fontsize=10)
+        b.plot(s.param, s["out_deficit_%"], "o-", color="#d62728", label="deficit days, out-of-sample")
+        b.plot(s.param, s["in_deficit_%"], "s--", color="#d62728", alpha=0.6, label="deficit days, in-sample")
+        b.plot(s.param, s["out_exceed_%"], "^-", color="#9467bd", label="days above cap, out-of-sample")
+        b.set_ylabel("share of days (%)")
+        b.set_xlabel(xlab)
+        b.set_xticks(s.param)
+        for ax in (a, b):
+            ax.grid(alpha=0.3)
+            ax.legend(fontsize=7)
+    fig.tight_layout()
+    for ext in ("png", "pdf"):
+        fig.savefig(out_dir / f"q3_risk.{ext}", dpi=200)
+    plt.close(fig)
+    print(f"Figure written to {out_dir}: q3_risk.png/.pdf")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--community", default="base", help=f"base (shipped) or your own params_community_<name>.json; available: {list_communities()}")
@@ -929,6 +1102,11 @@ def main() -> None:
     ap.add_argument("--q3-verbose", action="store_true", help="Q3: print the Gurobi log of the SDP solves")
     ap.add_argument("--q3-nstudy", action="store_true", help="Q3 step 5: SDP^b for several N (nested) on the same 100 test days")
     ap.add_argument("--q3-ns", default="2,3,5,10", help="Q3 step 5: values of N, comma-separated")
+    ap.add_argument("--q3-risk", action="store_true", help="Q3 step 6: eps sweep of SDP^CC and beta_r sweep of SDP^CVaR")
+    ap.add_argument("--q3-epss", default="0,0.2,0.4", help="Q3 step 6: values of eps, comma-separated")
+    ap.add_argument("--q3-betas", default="0,0.25,0.5,0.75,1", help="Q3 step 6: values of beta_r, comma-separated")
+    ap.add_argument("--q3-cc-budget-tol", type=float, default=-1.0,
+                    help="Q3 step 4: elastic SDP^CC with this free band of the expected budget (DKK/day); negative = off")
     ap.add_argument("--q3-resolve-ns", default="", help="Q3 step 5: values of N to solve again, comma-separated")
     ap.add_argument("--q3-budget-tol", type=float, default=0.5,
                     help="Q3 step 5: free band of the expected budget balance (DKK/day), penalty beyond; negative = exact")
@@ -971,6 +1149,7 @@ def main() -> None:
                    n=args.q3_n, seed=args.q3_seed, n_out=args.q3_n_out, seed_out=args.q3_seed_out,
                    time_limit=args.q3_time_limit, resolve=args.q3_resolve,
                    alpha=args.q3_alpha, beta_r=args.q3_beta_r, eps=args.q3_eps, deficit_tol=args.q3_deficit_tol,
+                   cc_budget_tol=None if args.q3_cc_budget_tol < 0 else args.q3_cc_budget_tol,
                    verbose=args.q3_verbose)
     if args.q3_plot:
         plot_q3_sdp(RESULTS_DIR / args.community / args.day / "Q3")
@@ -980,6 +1159,14 @@ def main() -> None:
                        time_limit=args.q3_time_limit, resolve=args.q3_resolve,
                        budget_tol=None if args.q3_budget_tol < 0 else args.q3_budget_tol,
                        resolve_ns=[int(v) for v in args.q3_resolve_ns.split(",") if v.strip()], verbose=args.q3_verbose)
+    if args.q3_risk:
+        run_q3_risk_study(com, RESULTS_DIR / args.community / args.day / "Q3", n=args.q3_n, seed=args.q3_seed,
+                          n_out=args.q3_n_out, seed_out=args.q3_seed_out,
+                          epss=[float(v) for v in args.q3_epss.split(",")],
+                          betas=[float(v) for v in args.q3_betas.split(",")], alpha=args.q3_alpha,
+                          deficit_tol=args.q3_deficit_tol,
+                          cc_budget_tol=None if args.q3_cc_budget_tol < 0 else args.q3_cc_budget_tol,
+                          time_limit=args.q3_time_limit, resolve=args.q3_resolve, verbose=args.q3_verbose)
     if args.q3_validate:
         run_q3_validate(com)
 

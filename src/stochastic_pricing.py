@@ -229,7 +229,7 @@ class StochasticDP:
 
         # budget balance: payments collected = grid bill, in expectation or in every scenario
         surplus = {s: gp.quicksum(pay[s].values()) - grid[s] for s in S}
-        budget_slack = None
+        budget_slack, deficit_slack = None, {}
 
         def expected_balance():
             # budget_tol None: exactly balanced in expectation. Otherwise elastic: |E[surplus]| <= budget_tol is free
@@ -252,7 +252,12 @@ class StochasticDP:
             # expected balance, and a deficit allowed only in scenarios with v_s = 1, at most eps of them
             expected_balance()
             v_def = {s: m.addVar(vtype=GRB.BINARY, name=f"deficit_allowed[{s}]") for s in S}
-            m.addConstrs((surplus[s] >= -deficit_tol - big_m * v_def[s] for s in S), name="no_deficit")
+            if budget_tol is None:
+                m.addConstrs((surplus[s] >= -deficit_tol - big_m * v_def[s] for s in S), name="no_deficit")
+            else:                            # elastic, like the budget: a deficit beyond deficit_tol is penalised
+                deficit_slack = {s: m.addVar(lb=0.0, name=f"deficit_slack[{s}]") for s in S}
+                m.addConstrs((surplus[s] >= -deficit_tol - big_m * v_def[s] - deficit_slack[s] for s in S),
+                             name="no_deficit")
             m.addConstr(gp.quicksum(self.pi[s] * v_def[s] for s in S) <= eps + 1e-9, name="deficit_probability")
 
         # individual rationality against R on the same scenario data
@@ -273,6 +278,8 @@ class StochasticDP:
         regularization = reg * gp.quicksum(self.pi[s] * dev[s] for s in S)
         if budget_slack is not None:
             regularization = regularization + budget_penalty * budget_slack
+        if deficit_slack:
+            regularization = regularization + budget_penalty * gp.quicksum(self.pi[s] * deficit_slack[s] for s in S)
         zeta, eta, cvar = None, {}, None
         if objective == "cvar":
             # linear CVaR (Rockafellar-Uryasev): zeta = VaR threshold, eta_s = cost of scenario s above it
@@ -287,7 +294,7 @@ class StochasticDP:
         self.m, self.x, self.T, self.cap = m, x, T, cap
         self.v = {"blocks": blocks, "kkt": kkt, "phi": phi, "D": D, "pay": pay, "grid": grid, "cost": cost,
                   "imp": imp, "exp": exp, "exc": exc, "surplus": surplus, "expected_cost": expected_cost,
-                  "cvar": cvar, "v_def": v_def, "budget_slack": budget_slack}
+                  "cvar": cvar, "v_def": v_def, "budget_slack": budget_slack, "deficit_slack": deficit_slack}
         self.settings = {"objective": objective, "budget": budget, "ir": ir, "reg": reg}
         if budget_slack is not None:
             self.settings.update(budget_tol=budget_tol, budget_penalty=budget_penalty)
@@ -340,6 +347,8 @@ class StochasticDP:
         if v["budget_slack"] is not None:
             out["budget_slack_DKK"] = float(v["budget_slack"].X)
             out["expected_surplus_DKK"] = float(sum(self.pi[s] * v["surplus"][s].getValue() for s in self.members))
+        if v["deficit_slack"]:
+            out["max_deficit_slack_DKK"] = float(max(d.X for d in v["deficit_slack"].values()))
         R = self.reference_costs()
         rows, max_res = [], 0.0
         for s in self.members:
