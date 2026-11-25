@@ -127,6 +127,44 @@ member (model I) as the assignment defines them. The notation of the assignment 
 member index; the community's import and export at the connection point are P_imp_t and P_exp_t, the cap
 is P_DSO_t (`capacity_limit_kW`).
 
+### 3.1 Reproducing the results of the report
+
+Run every command from the repository root with the virtual environment active.
+All results are written to `results/base/d1/`.
+
+**Question 1** (each takes a few seconds):
+```bash
+python main.py --reference      # model R
+python main.py --individual     # model I
+python main.py --central        # model C
+python main.py --sensitivity    # discount and cap tightness
+python main.py --settlement     # settlement of the contract
+```
+
+**Question 2** (the numbers in the report come from these scripts, output in `Q2/`):
+```bash
+python q2_main.py --q2-best-response   # check that C's dispatch is each member's best response
+python q2_main.py --q2 cap             # DP with the cap only (seconds)
+python q2_main.py --q2 bb              # DP with budget balance (seconds)
+python q2_ir_relax.py                  # DP with budget balance and relaxed IR (180 s time limit)
+python q2_sensitivity.py               # DP over seven discount values (a few minutes)
+```
+The IR relaxation stops at its time limit, so its value is an upper bound and can differ between machines.
+`python main.py --q2` and `--q2-sensitivity` run an alternative implementation (output in `Q2_dp/`); it is not used in the report.
+
+**Question 3** (in-sample scenarios with seed 1, out-of-sample scenarios with seed 100):
+```bash
+python main.py --q3-baseline                              # deterministic DP prices tested on 100 scenarios
+python main.py --q3-validate                              # small check of the stochastic models on 2 scenarios
+python main.py --q3-sdp --q3-models b,cvar,cc --q3-n 5    # SDP^b, SDP^CVaR, SDP^CC, up to 300 s each
+python main.py --q3-plot                                  # figures from the saved CSV files
+python main.py --q3-nstudy --q3-ns 2,3,5,10               # SDP^b for several N on the same 100 test days (N = 10 needs about 900 s)
+python main.py --q3-risk                                  # eps sweep of SDP^CC and beta_r sweep of SDP^CVaR (long)
+```
+Saved prices are reused; add `--q3-resolve` to solve again.
+
+
+
 ## 4. Input data
 
 All input data lives in `data/`, in the conventions of Assignment 1: every field name carries its unit

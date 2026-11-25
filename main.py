@@ -1085,7 +1085,7 @@ def main() -> None:
     ap.add_argument("--q2-sensitivity", action="store_true", help="Q2: DP (cap, budget balance) over the discount; blocking members")
     ap.add_argument("--q2", action="store_true", help="Q2: DP on the base case, cap -> budget balance -> IR")
     ap.add_argument("--q3-baseline", action="store_true", help="Q3: deterministic DP prices on 100 out-of-sample scenarios")    
-    ap.add_argument("--q3-sdp", action="store_true", help="Q3: SDP^E vs DP, in-sample and out-of-sample")
+    ap.add_argument("--q3-sdp", action="store_true", help="Q3: SDP^b vs DP, in-sample and out-of-sample")
     ap.add_argument("--q3-models", default="b,cvar,cc", help="Q3: models to solve, comma-separated: b, cvar, cc")
     ap.add_argument("--q3-alpha", type=float, default=0.2, help="Q3: CVaR tail fraction (a multiple of 1/N)")
     ap.add_argument("--q3-beta-r", type=float, default=0.5, help="Q3: CVaR weight in the objective")
